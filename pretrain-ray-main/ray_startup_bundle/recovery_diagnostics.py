@@ -13,7 +13,13 @@ import argparse
 import json
 from pathlib import Path
 import shlex
+import sys
 from typing import Any, Mapping, Sequence
+
+try:
+    from . import cluster_config
+except ImportError:
+    import cluster_config
 
 try:  # Support both direct CLI execution and package-style imports in tests.
     from .environment_check import (
@@ -542,17 +548,34 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--active-node", action="append", required=True)
     parser.add_argument("--spare-node", action="append", required=True)
     parser.add_argument("--expected-npus", type=int, default=8)
-    parser.add_argument("--kubectl-command", default="kubectl")
+    parser.add_argument("--kubectl-command")
     parser.add_argument("--kubeconfig", type=Path)
-    parser.add_argument("--npu-resource", default=DEFAULT_NPU_RESOURCE)
-    parser.add_argument("--npu-exporter-app", default=DEFAULT_EXPORTER_APP)
-    parser.add_argument("--npu-exporter-port", type=int, default=DEFAULT_EXPORTER_PORT)
+    parser.add_argument("--npu-resource")
+    parser.add_argument("--npu-exporter-app")
+    parser.add_argument("--npu-exporter-port", type=int)
     parser.add_argument("--compact", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
+    try:
+        defaults = cluster_config.apply_kubernetes_defaults(args)
+        if (
+            args.npu_resource is None
+            or args.npu_exporter_app is None
+            or args.npu_exporter_port is None
+        ):
+            defaults = defaults or cluster_config.load_cluster_config()
+        if args.npu_resource is None:
+            args.npu_resource = defaults.npu_check.resource_name
+        if args.npu_exporter_app is None:
+            args.npu_exporter_app = defaults.npu_check.exporter_app
+        if args.npu_exporter_port is None:
+            args.npu_exporter_port = defaults.npu_check.exporter_port
+    except cluster_config.ClusterConfigError as error:
+        print(f"STOP: recovery configuration could not be read: {error}", file=sys.stderr)
+        return 2
     result = diagnose_replacement(
         kubectl_command=args.kubectl_command,
         kubeconfig=args.kubeconfig,

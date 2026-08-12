@@ -14,20 +14,18 @@ import sys
 import time
 from typing import Callable, Sequence
 
+import cluster_config
+
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = BUNDLE_DIR / "raycluster.yaml"
 DEFAULT_RUNTIME_SOURCE = BUNDLE_DIR / "hccl_runtime"
-DEFAULT_TRAIN_SCRIPT = (
-    BUNDLE_DIR / "training_templates" / "pretrain_150M-22.sh"
-)
 DEFAULT_LOG_ROOT = BUNDLE_DIR.parent / "log"
 DEFAULT_EVIDENCE_ROOT = DEFAULT_LOG_ROOT / "hccl-startup"
 DEFAULT_TRAINING_ARTIFACT_ROOT = (
     DEFAULT_LOG_ROOT / "training-runs"
 )
-DEFAULT_TRAINING_CWD = "/mnt/models/CODE/MindSpeed-LLM-v2.3.0"
-DEFAULT_NODES = ("110.129.0.20", "110.129.0.22")
+DEFAULT_WORKER_ARCHIVE_ROOT = "/mnt/models/pretrain-ray-platform/archive"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 Stage = tuple[str, Sequence[str]]
 
@@ -37,13 +35,115 @@ def new_run_id() -> str:
     return f"train-{timestamp}-{secrets.token_hex(4)}"
 
 
+def selected_worker_nodes(args: argparse.Namespace) -> tuple[str, ...]:
+    explicit = tuple(args.node or ())
+    all_nodes = bool(getattr(args, "all_nodes", False))
+    if all_nodes and explicit and not getattr(args, "_nodes_from_config", False):
+        raise ValueError("--all-nodes cannot be combined with explicit --node values")
+    if explicit:
+        return explicit
+    defaults = cluster_config.load_cluster_config()
+    return defaults.all_nodes if all_nodes else defaults.active_nodes
+
+
+def apply_config_defaults(
+    args: argparse.Namespace,
+    config: cluster_config.ClusterConfig | None = None,
+) -> cluster_config.ClusterConfig | None:
+    """Materialize YAML defaults once; explicit CLI values always win."""
+
+    configurable = (
+        "kubectl_command",
+        "kubeconfig",
+        "namespace",
+        "cluster",
+        "runtime_configmap",
+        "head_node",
+        "timeout_seconds",
+        "hccl_timeout_seconds",
+        "failure_retention_seconds",
+        "train_script",
+        "training_cwd",
+        "training_timeout_seconds",
+        "npu_resource",
+        "npu_exporter_namespace",
+        "npu_exporter_app",
+        "npu_exporter_port",
+        "supervisor_node",
+        "supervisor_service_account",
+        "supervisor_image",
+        "supervisor_image_pull_policy",
+        "supervisor_kubectl_host_path",
+        "supervisor_backoff_limit",
+        "supervisor_finished_ttl_seconds",
+    )
+    needs_config = getattr(args, "node", None) is None or any(
+        getattr(args, destination, None) is None for destination in configurable
+    )
+    if not needs_config:
+        return config
+    defaults = config or cluster_config.load_cluster_config()
+
+    def fill(destination: str, value: object) -> None:
+        if getattr(args, destination, None) is None:
+            setattr(args, destination, value)
+
+    fill("kubectl_command", defaults.kubernetes.kubectl_command)
+    fill("kubeconfig", defaults.kubernetes.kubeconfig)
+    fill("namespace", defaults.kubernetes.namespace)
+    fill("cluster", defaults.kubernetes.cluster_name)
+    fill("head_node", defaults.topology.head_node)
+    fill("timeout_seconds", defaults.timeouts.ray_startup_seconds)
+    fill("hccl_timeout_seconds", defaults.timeouts.hccl_gate_seconds)
+    fill(
+        "failure_retention_seconds",
+        defaults.timeouts.failed_resource_retention_seconds,
+    )
+    fill("train_script", defaults.training.template)
+    fill("training_cwd", defaults.training.working_directory)
+    fill("training_timeout_seconds", defaults.timeouts.training_seconds)
+    fill("npu_resource", defaults.npu_check.resource_name)
+    fill("npu_exporter_namespace", defaults.npu_check.exporter_namespace)
+    fill("npu_exporter_app", defaults.npu_check.exporter_app)
+    fill("npu_exporter_port", defaults.npu_check.exporter_port)
+    fill("supervisor_node", defaults.supervisor.node)
+    fill("supervisor_service_account", defaults.supervisor.service_account)
+    fill("supervisor_image", defaults.supervisor.image)
+    fill("supervisor_image_pull_policy", defaults.supervisor.image_pull_policy)
+    fill("supervisor_kubectl_host_path", defaults.supervisor.kubectl_host_path)
+    fill("supervisor_backoff_limit", defaults.supervisor.backoff_limit)
+    fill(
+        "supervisor_finished_ttl_seconds",
+        defaults.supervisor.finished_ttl_seconds,
+    )
+    if getattr(args, "node", None) is None:
+        args.node = list(
+            defaults.all_nodes
+            if bool(getattr(args, "all_nodes", False))
+            else defaults.active_nodes
+        )
+        args._nodes_from_config = True
+        args.allow_topology_change = True
+    if getattr(args, "runtime_configmap", None) is None:
+        args.runtime_configmap = f"{args.cluster}-hccl-runtime"
+    return defaults
+
+
 def execute_pipeline(
     stages: Sequence[Stage],
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     failure_handler: Callable[[int, str], None] | None = None,
+    before_stage: Callable[[int, str], bool] | None = None,
 ) -> int:
     for index, (name, command) in enumerate(stages, start=1):
+        if before_stage is not None and not before_stage(index, name):
+            print(
+                f"STOP: stage {index} was not started because a stop request was accepted.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 130
         print(f"=== Stage {index}/{len(stages)}: {name} ===", flush=True)
         print("$ " + shlex.join(command), flush=True)
         result = runner(list(command), check=False, shell=False)
@@ -158,14 +258,22 @@ def retain_then_delete_cluster(
 
 
 def make_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="kcc_ray start",
+        description=__doc__,
+    )
     parser.add_argument(
         "--node",
         action="append",
         help=(
             "target node name or InternalIP; repeat as needed "
-            "(defaults to gpu-server-00/01 IPs)"
+            "(defaults to config/cluster.yaml activeNodes)"
         ),
+    )
+    parser.add_argument(
+        "--all-nodes",
+        action="store_true",
+        help="use activeNodes and spareNodes together without a standby pool",
     )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument(
@@ -175,26 +283,30 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--runtime-configmap",
-        default="pretrain-gpu00-gpu01-hccl-runtime",
+        help="runtime ConfigMap name; defaults to <cluster>-hccl-runtime",
     )
     parser.add_argument(
         "--kubectl-command",
-        default="/usr/local/bin/k3s kubectl",
+        help="kubectl command prefix; defaults to config/cluster.yaml",
     )
     parser.add_argument(
         "--kubeconfig",
         type=Path,
-        default=Path("/home/ywj/.kube/k3s-learning.yaml"),
+        help="Kubernetes kubeconfig; defaults to config/cluster.yaml",
     )
-    parser.add_argument("--namespace", default="pretrain-ray")
-    parser.add_argument("--cluster", default="pretrain-gpu00-gpu01")
+    parser.add_argument("--namespace", help="defaults to config/cluster.yaml")
+    parser.add_argument("--cluster", help="defaults to config/cluster.yaml")
+    parser.add_argument(
+        "--head-node",
+        help="Ray head Kubernetes node; defaults to config/cluster.yaml",
+    )
     parser.add_argument(
         "--expected-workers",
         type=int,
         help="optional assertion; normally derived from the repeated --node values",
     )
-    parser.add_argument("--timeout-seconds", type=int, default=1800)
-    parser.add_argument("--hccl-timeout-seconds", type=int, default=3600)
+    parser.add_argument("--timeout-seconds", type=int)
+    parser.add_argument("--hccl-timeout-seconds", type=int)
     parser.add_argument(
         "--expected-world-size",
         type=int,
@@ -208,8 +320,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--failure-retention-seconds",
         type=int,
-        default=1800,
-        help="failed Ray/HCCL startup retention; -1 keeps resources indefinitely",
+        help=(
+            "failed Ray/HCCL startup retention; -1 keeps resources indefinitely; "
+            "defaults to config/cluster.yaml"
+        ),
     )
     parser.add_argument(
         "--run-id",
@@ -218,13 +332,17 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--train-script",
         type=Path,
-        default=DEFAULT_TRAIN_SCRIPT,
-        help="formal training template copied and injected per worker",
+        help=(
+            "select a formal training template; defaults to the template selected "
+            "by config/cluster.yaml"
+        ),
     )
     parser.add_argument(
         "--training-cwd",
-        default=DEFAULT_TRAINING_CWD,
-        help="absolute training source directory inside every Ray worker",
+        help=(
+            "absolute training source directory inside every Ray worker; "
+            "defaults to config/cluster.yaml"
+        ),
     )
     parser.add_argument(
         "--training-artifact-root",
@@ -244,13 +362,68 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm-checkpoint-exclusive",
         action="store_true",
-        help="attest that no other job writes the source CKPT_SAVE_DIR",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "start from iteration zero and create a new worker archive for "
+            "checkpoints and logs"
+        ),
     )
     parser.add_argument(
         "--training-timeout-seconds",
         type=int,
-        default=0,
-        help="per-worker formal training timeout; 0 means no timeout",
+        help=(
+            "per-worker formal training timeout; 0 means no timeout; "
+            "defaults to config/cluster.yaml"
+        ),
+    )
+    parser.add_argument(
+        "--npu-resource", help="single-run override for npuCheck.resourceName"
+    )
+    parser.add_argument(
+        "--npu-exporter-namespace",
+        help="single-run override for npuCheck.exporterNamespace",
+    )
+    parser.add_argument(
+        "--npu-exporter-app", help="single-run override for npuCheck.exporterApp"
+    )
+    parser.add_argument(
+        "--npu-exporter-port",
+        type=int,
+        help="single-run override for npuCheck.exporterPort",
+    )
+    parser.add_argument(
+        "--supervisor-node", help="single-run override for supervisor.node"
+    )
+    parser.add_argument(
+        "--supervisor-service-account",
+        help="single-run override for supervisor.serviceAccount",
+    )
+    parser.add_argument(
+        "--supervisor-image", help="single-run digest-pinned Supervisor image"
+    )
+    parser.add_argument(
+        "--supervisor-image-pull-policy",
+        choices=("Always", "IfNotPresent", "Never"),
+        help="single-run override for supervisor.imagePullPolicy",
+    )
+    parser.add_argument(
+        "--supervisor-kubectl-host-path",
+        type=Path,
+        help="single-run override for supervisor.kubectlHostPath",
+    )
+    parser.add_argument(
+        "--supervisor-backoff-limit",
+        type=int,
+        help="single-run override for supervisor.backoffLimit",
+    )
+    parser.add_argument(
+        "--supervisor-finished-ttl-seconds",
+        type=int,
+        help="single-run override for supervisor.finishedTtlSeconds",
     )
     parser.add_argument(
         "--keep-success-resources",
@@ -265,7 +438,9 @@ def build_stage_commands(
     *,
     run_id: str,
 ) -> tuple[Stage, ...]:
-    nodes = tuple(args.node or DEFAULT_NODES)
+    apply_config_defaults(args)
+    fresh_start = bool(getattr(args, "fresh", False))
+    nodes = selected_worker_nodes(args)
     worker_count = len(nodes)
     script_dir = Path(__file__).resolve().parent
     hccl_run_dir = args.hccl_evidence_root.resolve() / run_id
@@ -286,6 +461,12 @@ def build_stage_commands(
             args.kubectl_command,
             "--kubeconfig",
             str(args.kubeconfig),
+            "--npu-resource",
+            args.npu_resource,
+            "--npu-exporter-app",
+            args.npu_exporter_app,
+            "--npu-exporter-port",
+            str(args.npu_exporter_port),
         )
     )
 
@@ -304,6 +485,10 @@ def build_stage_commands(
         args.namespace,
         "--cluster",
         args.cluster,
+        "--head-node",
+        args.head_node,
+        "--npu-resource",
+        args.npu_resource,
         "--runtime-configmap",
         args.runtime_configmap,
         "--run-id",
@@ -383,10 +568,10 @@ def build_stage_commands(
         injection_command.extend(("--master-port", str(args.master_port)))
     if args.allow_topology_change:
         injection_command.append("--allow-topology-change")
-    if args.confirm_checkpoint_exclusive:
-        injection_command.append("--confirm-checkpoint-exclusive")
     if getattr(args, "require_resumable_checkpoint", False):
         injection_command.append("--require-resumable-checkpoint")
+    if fresh_start:
+        injection_command.append("--fresh")
 
     training_command = [
         sys.executable,
@@ -421,14 +606,34 @@ def build_stage_commands(
 
 
 def validate_args(args: argparse.Namespace, run_id: str) -> None:
+    apply_config_defaults(args)
+    fresh_start = bool(getattr(args, "fresh", False))
     if RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise ValueError("run ID contains unsupported characters")
+    cluster_config.validate_dns_label(args.namespace, "namespace")
+    cluster_config.validate_dns_label(args.cluster, "cluster")
+    cluster_config.validate_dns_label(args.runtime_configmap, "runtime ConfigMap")
+    cluster_config.validate_dns_label(
+        args.npu_exporter_namespace, "NPU exporter namespace"
+    )
+    cluster_config.validate_dns_label(
+        args.supervisor_service_account, "supervisor service account"
+    )
+    cluster_config.validate_pinned_image(args.supervisor_image, "supervisor image")
+    for label, value in (
+        ("head node", args.head_node),
+        ("supervisor node", args.supervisor_node),
+        ("NPU resource", args.npu_resource),
+        ("NPU exporter app", args.npu_exporter_app),
+    ):
+        if not value or any(character.isspace() for character in value):
+            raise ValueError(f"{label} must be non-empty and whitespace-free")
     if (
         args.timeout_seconds <= 0
         or args.hccl_timeout_seconds <= 0
     ):
         raise ValueError("workers and startup/HCCL timeouts must be positive")
-    nodes = tuple(args.node or DEFAULT_NODES)
+    nodes = selected_worker_nodes(args)
     if len(set(nodes)) != len(nodes):
         raise ValueError("worker node targets must be unique")
     if args.expected_workers is not None and args.expected_workers != len(nodes):
@@ -445,14 +650,13 @@ def validate_args(args: argparse.Namespace, run_id: str) -> None:
     checkpoint_save_dir = source_checkpoint_save_dir(
         args.train_script.resolve()
     )
-    if (
-        checkpoint_save_dir is not None
-        and not args.confirm_checkpoint_exclusive
-    ):
+    if fresh_start and checkpoint_save_dir is None:
         raise ValueError(
-            "training writes checkpoints to "
-            f"{checkpoint_save_dir}; --confirm-checkpoint-exclusive is "
-            "required before any cluster is started"
+            "fresh start requires the training script to enable --save"
+        )
+    if fresh_start and getattr(args, "require_resumable_checkpoint", False):
+        raise ValueError(
+            "fresh start cannot require an existing resumable checkpoint"
         )
     if (
         args.expected_world_size is not None
@@ -463,6 +667,14 @@ def validate_args(args: argparse.Namespace, run_id: str) -> None:
         raise ValueError("failure retention must be -1 or non-negative")
     if args.training_timeout_seconds < 0:
         raise ValueError("training timeout must be zero or positive")
+    if not 1 <= args.npu_exporter_port <= 65535:
+        raise ValueError("NPU exporter port must be within 1..65535")
+    if args.supervisor_backoff_limit < 0:
+        raise ValueError("Supervisor backoff limit must be non-negative")
+    if args.supervisor_finished_ttl_seconds <= 0:
+        raise ValueError("Supervisor finished TTL must be positive")
+    if not args.supervisor_kubectl_host_path.is_absolute():
+        raise ValueError("Supervisor kubectl host path must be absolute")
     if args.master_port is not None and not 1024 <= args.master_port <= 65535:
         raise ValueError("master port must be within 1024..65535")
     if not args.training_cwd.startswith("/"):
@@ -473,12 +685,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
     run_id = args.run_id or new_run_id()
     try:
+        apply_config_defaults(args)
         validate_args(args, run_id)
         stages = build_stage_commands(args, run_id=run_id)
     except ValueError as error:
         print(f"STOP: invalid workflow arguments: {error}", file=sys.stderr)
         return 2
     print(f"Run ID: {run_id}", flush=True)
+    if bool(getattr(args, "fresh", False)):
+        print(
+            "Fresh archive: "
+            f"{DEFAULT_WORKER_ARCHIVE_ROOT}/{run_id}",
+            flush=True,
+        )
     print(
         "Training result: "
         f"{args.training_artifact_root.resolve() / run_id / 'execution-result.json'}",

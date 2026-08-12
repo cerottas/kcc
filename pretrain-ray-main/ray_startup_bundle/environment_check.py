@@ -12,6 +12,8 @@ import subprocess
 import sys
 from typing import Any, Mapping, Sequence
 
+import cluster_config
+
 
 DEFAULT_NPU_RESOURCE = "huawei.com/Ascend910"
 DEFAULT_EXPORTER_APP = "npu-exporter"
@@ -149,6 +151,14 @@ def check_kubernetes_npu_occupancy(
             condition.get("type"): condition.get("status")
             for condition in status.get("conditions", [])
         }
+        internal_ip = next(
+            (
+                address.get("address")
+                for address in status.get("addresses", [])
+                if address.get("type") == "InternalIP"
+            ),
+            "unknown",
+        )
         capacity = int(status.get("capacity", {}).get(resource_name, 0))
         allocatable = int(status.get("allocatable", {}).get(resource_name, 0))
         ready = conditions.get("Ready") == "True"
@@ -156,6 +166,7 @@ def check_kubernetes_npu_occupancy(
             {
                 "name": name,
                 "target": target,
+                "ip": internal_ip,
                 "ready": ready,
                 "chip": metadata.get("labels", {}).get(
                     "node.kubernetes.io/npu.chip.name"
@@ -200,8 +211,9 @@ def check_kubernetes_npu_occupancy(
 def print_occupancy_result(result: Mapping[str, Any]) -> None:
     print("=== Environment check: Kubernetes NPU occupancy ===")
     for node in result["nodes"]:
+        address = node.get("ip") or node.get("target", "unknown")
         print(
-            f"{node['name']} ({node['target']}): "
+            f"{node['name']} ({address}): "
             f"Ready={node['ready']}, chip={node['chip']}, "
             f"NPU={node['allocatable']}/{node['capacity']}"
         )
@@ -218,7 +230,7 @@ def print_occupancy_result(result: Mapping[str, Any]) -> None:
     if result["passed"]:
         print("PASS: no active Kubernetes NPU owner was found.")
     else:
-        print("STOP: environment check failed; subsequent steps must not run.")
+        print("STOP: environment check failed; Ray/training must not start.")
 
 
 def metric_samples(text: str, metric_name: str) -> list[dict[str, Any]]:
@@ -252,11 +264,11 @@ def parse_npu_exporter_metrics(text: str) -> dict[str, Any]:
     process_samples = metric_samples(text, "npu_chip_info_process_info")
 
     visible = int(machine_samples[0]["value"]) if machine_samples else 0
-    unhealthy = sorted(
-        sample["labels"].get("id", "?")
+    health = {
+        sample["labels"].get("id", "?"): sample["value"] == 1
         for sample in health_samples
-        if sample["value"] != 1
-    )
+    }
+    unhealthy = sorted(npu for npu, healthy in health.items() if not healthy)
     occupied = {
         sample["labels"].get("id", "?"): int(sample["value"])
         for sample in count_samples
@@ -282,6 +294,7 @@ def parse_npu_exporter_metrics(text: str) -> dict[str, Any]:
         "visible": visible,
         "health_samples": len(health_samples),
         "healthy": len(health_samples) - len(unhealthy),
+        "health": health,
         "unhealthy": unhealthy,
         "process_count": sum(occupied.values()),
         "occupied": occupied,
@@ -355,6 +368,7 @@ def check_actual_npu_state(
             **state,
             "name": node_name,
             "target": node["target"],
+            "ip": node.get("ip") or node["target"],
             "expected": node["capacity"],
         }
         reports.append(report)
@@ -382,15 +396,34 @@ def check_actual_npu_state(
     }
 
 
-def print_actual_npu_result(result: Mapping[str, Any]) -> None:
+def print_actual_npu_result(
+    result: Mapping[str, Any], *, per_card: bool = False
+) -> None:
     print("=== Environment check: actual NPU state ===")
     for node in result["nodes"]:
+        address = node.get("ip") or node.get("target", "unknown")
         print(
-            f"{node['name']} ({node['target']}): "
+            f"{node['name']} ({address}): "
             f"visible={node['visible']}, "
             f"healthy={node['healthy']}/{node['visible']}, "
             f"processes={node['process_count']}"
         )
+        if per_card:
+            for npu in range(node["visible"]):
+                npu_id = str(npu)
+                process_count = node["occupied"].get(npu_id, 0)
+                health = node["health"].get(npu_id)
+                if health is True:
+                    health_text = "healthy"
+                elif health is False:
+                    health_text = "unhealthy"
+                else:
+                    health_text = "unknown"
+                state = "occupied" if process_count else "idle"
+                print(
+                    f"  NPU {npu_id}: health={health_text}, "
+                    f"state={state}, processes={process_count}"
+                )
         for process in node["processes"]:
             owner = (
                 f"{process['namespace']}/{process['pod']}"
@@ -419,37 +452,69 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--node",
         action="append",
-        required=True,
-        help="target Kubernetes node name or InternalIP; repeat as needed",
+        help=(
+            "target Kubernetes node name or InternalIP; repeat as needed "
+            "(defaults to activeNodes + spareNodes from config/cluster.yaml)"
+        ),
     )
     parser.add_argument(
         "--kubectl-command",
-        default="kubectl",
         help="kubectl command prefix, for example '/usr/local/bin/k3s kubectl'",
     )
     parser.add_argument("--kubeconfig", type=Path)
-    parser.add_argument("--npu-resource", default=DEFAULT_NPU_RESOURCE)
-    parser.add_argument("--npu-exporter-app", default=DEFAULT_EXPORTER_APP)
-    parser.add_argument("--npu-exporter-port", type=int, default=DEFAULT_EXPORTER_PORT)
+    parser.add_argument("--npu-resource")
+    parser.add_argument("--npu-exporter-app")
+    parser.add_argument("--npu-exporter-port", type=int)
     return parser
+
+
+def apply_config_defaults(args: argparse.Namespace) -> None:
+    if (
+        args.node is not None
+        and args.kubectl_command is not None
+        and args.kubeconfig is not None
+        and args.npu_resource is not None
+        and args.npu_exporter_app is not None
+        and args.npu_exporter_port is not None
+    ):
+        return
+    defaults = cluster_config.load_cluster_config()
+    if args.node is None:
+        args.node = list(defaults.all_nodes)
+    if args.kubectl_command is None:
+        args.kubectl_command = defaults.kubernetes.kubectl_command
+    if args.kubeconfig is None:
+        args.kubeconfig = defaults.kubernetes.kubeconfig
+    if args.npu_resource is None:
+        args.npu_resource = defaults.npu_check.resource_name
+    if args.npu_exporter_app is None:
+        args.npu_exporter_app = defaults.npu_check.exporter_app
+    if args.npu_exporter_port is None:
+        args.npu_exporter_port = defaults.npu_check.exporter_port
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
     try:
+        apply_config_defaults(args)
+        if not 1 <= args.npu_exporter_port <= 65535:
+            raise CheckError("NPU exporter port must be within 1..65535")
         command = shlex.split(args.kubectl_command)
         if not command:
             raise CheckError("kubectl command is empty")
         nodes = kubectl_json(command, args.kubeconfig, "nodes")
         pods = kubectl_json(command, args.kubeconfig, "pods")
+        targets = tuple(args.node)
+        single_node = len(targets) == 1
         result = check_kubernetes_npu_occupancy(
             nodes,
             pods,
-            tuple(args.node),
+            targets,
             args.npu_resource,
         )
         print_occupancy_result(result)
-        if not result["passed"]:
+        inspect_single_node = single_node and len(result["nodes"]) == 1
+        if not result["passed"] and not inspect_single_node:
             return 1
 
         actual = check_actual_npu_state(
@@ -460,9 +525,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.npu_exporter_app,
             args.npu_exporter_port,
         )
-        print_actual_npu_result(actual)
-        return 0 if actual["passed"] else 1
-    except CheckError as error:
+        print_actual_npu_result(actual, per_card=single_node)
+        return 0 if result["passed"] and actual["passed"] else 1
+    except (CheckError, cluster_config.ClusterConfigError) as error:
         print(f"STOP: environment information could not be read: {error}")
         return 1
 

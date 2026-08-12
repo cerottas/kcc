@@ -14,6 +14,12 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 
+CLUSTER_TOKEN = "__KCC_RAY_CLUSTER__"
+NAMESPACE_TOKEN = "__KCC_RAY_NAMESPACE__"
+HEAD_NODE_TOKEN = "__KCC_RAY_HEAD_NODE__"
+NPU_RESOURCE_TOKEN = "__KCC_RAY_NPU_RESOURCE__"
+
+
 class RenderError(RuntimeError):
     pass
 
@@ -92,6 +98,26 @@ def require_mapping(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def replace_template_tokens(value: Any, replacements: Mapping[str, str]) -> Any:
+    """Replace explicit template tokens in values and mapping keys."""
+    if isinstance(value, str):
+        result = value
+        for token, replacement in replacements.items():
+            result = result.replace(token, replacement)
+        return result
+    if isinstance(value, list):
+        return [replace_template_tokens(item, replacements) for item in value]
+    if isinstance(value, dict):
+        result: dict[Any, Any] = {}
+        for key, item in value.items():
+            replaced_key = replace_template_tokens(key, replacements)
+            if replaced_key in result:
+                raise RenderError("template token replacement produced a duplicate key")
+            result[replaced_key] = replace_template_tokens(item, replacements)
+        return result
+    return value
+
+
 def update_runtime_configmap(
     pod_spec: dict[str, Any],
     runtime_configmap: str,
@@ -120,17 +146,28 @@ def render_manifest(
     node_names: Sequence[str],
     namespace: str,
     cluster: str,
+    head_node: str,
+    npu_resource: str,
     runtime_configmap: str,
     run_id: str,
 ) -> None:
     if not base_manifest.is_file() or base_manifest.is_symlink():
         raise RenderError(f"base manifest is not a regular file: {base_manifest}")
     try:
-        documents = list(
+        raw_documents = list(
             yaml.safe_load_all(base_manifest.read_text(encoding="utf-8"))
         )
     except (OSError, UnicodeError, yaml.YAMLError) as error:
         raise RenderError(f"cannot parse base RayCluster manifest: {error}") from error
+    replacements = {
+        CLUSTER_TOKEN: cluster,
+        NAMESPACE_TOKEN: namespace,
+        HEAD_NODE_TOKEN: head_node,
+        NPU_RESOURCE_TOKEN: npu_resource,
+    }
+    documents = [
+        replace_template_tokens(document, replacements) for document in raw_documents
+    ]
     rayclusters = [
         document
         for document in documents
@@ -205,6 +242,10 @@ def render_manifest(
         head_template.get("spec"),
         "Ray head Pod spec",
     )
+    head_selector = require_mapping(
+        head_spec.get("nodeSelector"), "Ray head node selector"
+    )
+    head_selector["kubernetes.io/hostname"] = head_node
     update_runtime_configmap(head_spec, runtime_configmap)
 
     if output_manifest.exists() or output_manifest.is_symlink():
@@ -232,6 +273,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kubeconfig", type=Path)
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--cluster", required=True)
+    parser.add_argument("--head-node", required=True)
+    parser.add_argument("--npu-resource", required=True)
     parser.add_argument("--runtime-configmap", required=True)
     parser.add_argument("--run-id", required=True)
     return parser
@@ -251,6 +294,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             node_names=node_names,
             namespace=args.namespace,
             cluster=args.cluster,
+            head_node=args.head_node,
+            npu_resource=args.npu_resource,
             runtime_configmap=args.runtime_configmap,
             run_id=args.run_id,
         )

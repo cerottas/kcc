@@ -101,9 +101,9 @@ def _parse_ip(value: object, field: str, *, ipv4_only: bool = False) -> str:
 def clean_clusterd_hccl(hccl: dict[str, object]) -> CleanResult:
     """Return a validated CANN AI Server v1.0 rank table.
 
-    This function intentionally refuses to repair gaps or duplicate ranks.  The
-    only accepted transformation is ``new_rank = old_rank - min(old_ranks)``.
-    ClusterD metadata is deliberately omitted from the returned HCCL table.
+    Duplicate ranks are rejected.  Valid unique ranks are compacted in their
+    original order so stale gaps left by ClusterD do not reach HCCL.  ClusterD
+    metadata is deliberately omitted from the returned HCCL table.
     """
 
     if hccl.get("status") != "complete":
@@ -238,12 +238,10 @@ def clean_clusterd_hccl(hccl: dict[str, object]) -> CleanResult:
 
     ordered_ranks = sorted(seen_ranks)
     rank_offset = ordered_ranks[0]
-    expected_ranks = list(range(rank_offset, rank_offset + len(ordered_ranks)))
-    if ordered_ranks != expected_ranks:
-        raise HcclCleanError(
-            "global rank_id values contain a gap; refusing to hide a missing "
-            "worker/device"
-        )
+    normalized_by_source_rank = {
+        source_rank: normalized_rank
+        for normalized_rank, source_rank in enumerate(ordered_ranks)
+    }
 
     indexed_servers.sort(key=lambda item: item[0])
     official_servers = [server for _, _, server in indexed_servers]
@@ -253,7 +251,7 @@ def clean_clusterd_hccl(hccl: dict[str, object]) -> CleanResult:
         for device in devices:
             assert isinstance(device, dict)
             old_rank = _parse_rank(device["rank_id"], "rank_id")
-            device["rank_id"] = str(old_rank - rank_offset)
+            device["rank_id"] = str(normalized_by_source_rank[old_rank])
 
     normalized_ranks = sorted(
         int(device["rank_id"])

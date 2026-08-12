@@ -1,40 +1,40 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: pretrain-ray
+  name: __KCC_RAY_NAMESPACE__
   labels:
     app.kubernetes.io/part-of: pretrain-ray-platform
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: pretrain-gpu00-gpu01-hccl
-  namespace: pretrain-ray
+  name: __KCC_RAY_CLUSTER__-hccl
+  namespace: __KCC_RAY_NAMESPACE__
   labels:
-    app.kubernetes.io/name: pretrain-gpu00-gpu01
+    app.kubernetes.io/name: __KCC_RAY_CLUSTER__
     app.kubernetes.io/part-of: pretrain-ray-platform
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: pretrain-gpu00-gpu01-hccl
-  namespace: pretrain-ray
+  name: __KCC_RAY_CLUSTER__-hccl
+  namespace: __KCC_RAY_NAMESPACE__
   labels:
-    app.kubernetes.io/name: pretrain-gpu00-gpu01
+    app.kubernetes.io/name: __KCC_RAY_CLUSTER__
     app.kubernetes.io/part-of: pretrain-ray-platform
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames:
-      - job-summary-pretrain-gpu00-gpu01
-      - hccl-sanitized-pretrain-gpu00-gpu01
+      - job-summary-__KCC_RAY_CLUSTER__
+      - hccl-sanitized-__KCC_RAY_CLUSTER__
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
   - apiGroups: ["ray.io"]
     resources: ["rayclusters"]
-    resourceNames: ["pretrain-gpu00-gpu01"]
+    resourceNames: ["__KCC_RAY_CLUSTER__"]
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods"]
@@ -46,27 +46,27 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: pretrain-gpu00-gpu01-hccl
-  namespace: pretrain-ray
+  name: __KCC_RAY_CLUSTER__-hccl
+  namespace: __KCC_RAY_NAMESPACE__
   labels:
-    app.kubernetes.io/name: pretrain-gpu00-gpu01
+    app.kubernetes.io/name: __KCC_RAY_CLUSTER__
     app.kubernetes.io/part-of: pretrain-ray-platform
 subjects:
   - kind: ServiceAccount
-    name: pretrain-gpu00-gpu01-hccl
-    namespace: pretrain-ray
+    name: __KCC_RAY_CLUSTER__-hccl
+    namespace: __KCC_RAY_NAMESPACE__
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: pretrain-gpu00-gpu01-hccl
+  name: __KCC_RAY_CLUSTER__-hccl
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: pretrain-gpu00-gpu01-incluster-kubeconfig
-  namespace: pretrain-ray
+  name: __KCC_RAY_CLUSTER__-incluster-kubeconfig
+  namespace: __KCC_RAY_NAMESPACE__
   labels:
-    app.kubernetes.io/name: pretrain-gpu00-gpu01
+    app.kubernetes.io/name: __KCC_RAY_CLUSTER__
     app.kubernetes.io/part-of: pretrain-ray-platform
 data:
   kubeconfig: |
@@ -86,16 +86,16 @@ data:
         context:
           cluster: in-cluster
           user: service-account
-          namespace: pretrain-ray
+          namespace: __KCC_RAY_NAMESPACE__
     current-context: in-cluster
 ---
 apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
-  name: pretrain-gpu00-gpu01
-  namespace: pretrain-ray
+  name: __KCC_RAY_CLUSTER__
+  namespace: __KCC_RAY_NAMESPACE__
   labels:
-    app.kubernetes.io/name: pretrain-gpu00-gpu01
+    app.kubernetes.io/name: __KCC_RAY_CLUSTER__
     app.kubernetes.io/part-of: pretrain-ray-platform
     trainctl.io/purpose: pretrain-training
   annotations:
@@ -114,17 +114,17 @@ spec:
     template:
       metadata:
         labels:
-          app.kubernetes.io/name: pretrain-gpu00-gpu01
+          app.kubernetes.io/name: __KCC_RAY_CLUSTER__
           app.kubernetes.io/component: ray-head
       spec:
-        serviceAccountName: pretrain-gpu00-gpu01-hccl
+        serviceAccountName: __KCC_RAY_CLUSTER__-hccl
         automountServiceAccountToken: true
         securityContext:
           fsGroup: 1000
           fsGroupChangePolicy: OnRootMismatch
         nodeSelector:
           kubernetes.io/arch: amd64
-          kubernetes.io/hostname: server-00
+          kubernetes.io/hostname: __KCC_RAY_HEAD_NODE__
         terminationGracePeriodSeconds: 30
         containers:
           - name: ray-head
@@ -185,7 +185,7 @@ spec:
         volumes:
           - name: runtime-source
             configMap:
-              name: pretrain-gpu00-gpu01-hccl-runtime
+              name: __KCC_RAY_CLUSTER__-hccl-runtime
               defaultMode: 0444
               items:
                 - key: hccl-check-src.tgz
@@ -194,7 +194,7 @@ spec:
             emptyDir: {}
           - name: ranktable
             configMap:
-              name: hccl-sanitized-pretrain-gpu00-gpu01
+              name: hccl-sanitized-__KCC_RAY_CLUSTER__
               optional: true
               defaultMode: 0444
               items:
@@ -208,7 +208,7 @@ spec:
               type: File
           - name: incluster-kubeconfig
             configMap:
-              name: pretrain-gpu00-gpu01-incluster-kubeconfig
+              name: __KCC_RAY_CLUSTER__-incluster-kubeconfig
               defaultMode: 0444
 
   workerGroupSpecs:
@@ -222,7 +222,7 @@ spec:
       template:
         metadata:
           labels:
-            app.kubernetes.io/name: pretrain-gpu00-gpu01
+            app.kubernetes.io/name: __KCC_RAY_CLUSTER__
             app.kubernetes.io/component: ray-worker
         spec:
           automountServiceAccountToken: false
@@ -244,7 +244,7 @@ spec:
               requiredDuringSchedulingIgnoredDuringExecution:
                 - labelSelector:
                     matchLabels:
-                      ray.io/cluster: pretrain-gpu00-gpu01
+                      ray.io/cluster: __KCC_RAY_CLUSTER__
                       ray.io/node-type: worker
                   topologyKey: kubernetes.io/hostname
           terminationGracePeriodSeconds: 30
@@ -303,11 +303,11 @@ spec:
                 requests:
                   cpu: "32"
                   memory: 128Gi
-                  huawei.com/Ascend910: "8"
+                  __KCC_RAY_NPU_RESOURCE__: "8"
                 limits:
                   cpu: "128"
                   memory: 512Gi
-                  huawei.com/Ascend910: "8"
+                  __KCC_RAY_NPU_RESOURCE__: "8"
               volumeMounts:
                 - name: runtime-source
                   mountPath: /opt/trainctl-source
@@ -333,7 +333,7 @@ spec:
           volumes:
             - name: runtime-source
               configMap:
-                name: pretrain-gpu00-gpu01-hccl-runtime
+                name: __KCC_RAY_CLUSTER__-hccl-runtime
                 defaultMode: 0444
                 items:
                   - key: hccl-check-src.tgz
@@ -342,7 +342,7 @@ spec:
               emptyDir: {}
             - name: ranktable
               configMap:
-                name: hccl-sanitized-pretrain-gpu00-gpu01
+                name: hccl-sanitized-__KCC_RAY_CLUSTER__
                 optional: true
                 defaultMode: 0444
                 items:

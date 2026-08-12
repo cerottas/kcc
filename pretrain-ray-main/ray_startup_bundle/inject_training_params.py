@@ -19,6 +19,7 @@ RANK_TABLE_PATH = "/user/serverid/devindex/config/hccl.json"
 MS_TORCHRUN = "/root/miniconda3/envs/ms/bin/torchrun"
 DEFAULT_TRAINING_CWD = "/mnt/models/CODE/MindSpeed-LLM-v2.3.0"
 DEFAULT_LOG_ROOT = "/mnt/models/pretrain-ray-platform/log"
+DEFAULT_ARCHIVE_ROOT = "/mnt/models/pretrain-ray-platform/archive"
 
 
 class InjectionError(RuntimeError):
@@ -299,6 +300,36 @@ def source_has_option(source: str, option: str) -> bool:
     ) is not None
 
 
+def remove_active_option(text: str, option: str) -> str:
+    pattern = rf"^[ \t]*{re.escape(option)}(?:[ \t=].*)?(?:\n|$)"
+    updated, count = re.subn(pattern, "", text, flags=re.MULTILINE)
+    if count > 1:
+        raise InjectionError(
+            f"{option}: expected at most one active option, found {count}"
+        )
+    return updated
+
+
+def replace_optional_option_value(
+    text: str,
+    *,
+    option: str,
+    value: str,
+) -> str:
+    pattern = rf"^([ \t]*){re.escape(option)}(?:[ \t=]+)[^ \t\\#]+([ \t]+\\)?[ \t]*$"
+    updated, count = re.subn(
+        pattern,
+        lambda match: f"{match.group(1)}{option} {value}{match.group(2) or ''}",
+        text,
+        flags=re.MULTILINE,
+    )
+    if count > 1:
+        raise InjectionError(
+            f"{option}: expected at most one active option, found {count}"
+        )
+    return updated
+
+
 def render_script(
     source: str,
     *,
@@ -308,9 +339,43 @@ def render_script(
     workers: int,
     npus_per_worker: int,
     node_rank: int,
+    fresh_start: bool = False,
 ) -> tuple[str, str]:
-    log_file = f"{DEFAULT_LOG_ROOT}/{run_id}/logs/node-rank-{node_rank}.log"
+    if fresh_start:
+        archive_root = f"{DEFAULT_ARCHIVE_ROOT}/{run_id}"
+        log_root = f"{archive_root}/logs"
+    else:
+        archive_root = None
+        log_root = f"{DEFAULT_LOG_ROOT}/{run_id}/logs"
+    log_file = f"{log_root}/node-rank-{node_rank}.log"
     text = source
+    if fresh_start:
+        checkpoint_dir = f"{archive_root}/checkpoints"
+        text = replace_once(
+            text,
+            r"^[ \t]*(?:export[ \t]+)?CKPT_SAVE_DIR=.*$",
+            f'CKPT_SAVE_DIR="{checkpoint_dir}"',
+            "CKPT_SAVE_DIR",
+        )
+        if source_checkpoint_load_dir(source) is not None:
+            text = replace_once(
+                text,
+                r"^[ \t]*(?:export[ \t]+)?CKPT_LOAD_DIR=.*$",
+                f'CKPT_LOAD_DIR="{checkpoint_dir}"',
+                "CKPT_LOAD_DIR",
+            )
+        text = remove_active_option(text, "--load")
+        text = remove_active_option(text, "--exit-on-missing-checkpoint")
+        text = replace_optional_option_value(
+            text,
+            option="--wandb-save-dir",
+            value=f"{log_root}/wandb",
+        )
+        text = replace_optional_option_value(
+            text,
+            option="--tensorboard-dir",
+            value=f"{log_root}/tensorboard",
+        )
     replacements = (
         (
             r"^[ \t]*export[ \t]+RANK_TABLE_FILE=.*$",
@@ -379,9 +444,12 @@ def create_injection(
     training_cwd: str,
     master_port: int | None,
     allow_topology_change: bool,
-    confirm_checkpoint_exclusive: bool,
+    confirm_checkpoint_exclusive: bool = False,
     require_resumable_checkpoint: bool = False,
+    fresh_start: bool = False,
 ) -> Path:
+    # Accepted only for callers using the former API; it no longer gates writes.
+    del confirm_checkpoint_exclusive
     if RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise InjectionError("run ID contains unsupported characters")
     if not training_cwd.startswith("/"):
@@ -394,11 +462,13 @@ def create_injection(
         raise InjectionError(f"cannot read training source: {error}") from error
     checkpoint_save_dir = source_checkpoint_save_dir(source)
     checkpoint_load_dir = source_checkpoint_load_dir(source)
-    if checkpoint_save_dir is not None and not confirm_checkpoint_exclusive:
+    if fresh_start and require_resumable_checkpoint:
         raise InjectionError(
-            "training enables checkpoint writes to "
-            f"{checkpoint_save_dir}; explicit --confirm-checkpoint-exclusive "
-            "is required to attest that no other job writes this directory"
+            "fresh start cannot require an existing resumable checkpoint"
+        )
+    if fresh_start and checkpoint_save_dir is None:
+        raise InjectionError(
+            "fresh start requires one active --save and CKPT_SAVE_DIR"
         )
     if require_resumable_checkpoint:
         if checkpoint_load_dir is None:
@@ -463,9 +533,26 @@ def create_injection(
             "discovered topology differs from the source script "
             f"({source_workers}x{source_npus_per_worker} -> "
             f"{worker_count}x{npus_per_worker}); "
-            "checkpoint compatibility and an exclusive save directory must "
-            "be confirmed with explicit --allow-topology-change approval"
+            "checkpoint compatibility must be reviewed before explicit "
+            "--allow-topology-change approval"
         )
+
+    archive_root = (
+        f"{DEFAULT_ARCHIVE_ROOT}/{run_id}" if fresh_start else None
+    )
+    runtime_log_root = (
+        f"{archive_root}/logs"
+        if archive_root is not None
+        else f"{DEFAULT_LOG_ROOT}/{run_id}"
+    )
+    effective_checkpoint_save_dir = (
+        f"{archive_root}/checkpoints"
+        if archive_root is not None
+        else checkpoint_save_dir
+    )
+    effective_checkpoint_load_dir = (
+        None if fresh_start else checkpoint_load_dir
+    )
 
     try:
         output_dir.mkdir(parents=True, exist_ok=False)
@@ -487,6 +574,7 @@ def create_injection(
             workers=worker_count,
             npus_per_worker=npus_per_worker,
             node_rank=node_rank,
+            fresh_start=fresh_start,
         )
         script_name = f"train-node-rank-{node_rank}.sh"
         script_path = scripts_dir / script_name
@@ -512,6 +600,7 @@ def create_injection(
     manifest = {
         "schemaVersion": "training-injection/v1",
         "runId": run_id,
+        "launchMode": "fresh" if fresh_start else "resume",
         "source": {
             "path": str(source_path),
             "sha256": source_sha256,
@@ -540,7 +629,8 @@ def create_injection(
             "trainingCwd": training_cwd,
             "torchrun": MS_TORCHRUN,
             "shell": "/bin/bash -o pipefail",
-            "logRoot": f"{DEFAULT_LOG_ROOT}/{run_id}",
+            "logRoot": runtime_log_root,
+            "archiveRoot": archive_root,
         },
         "preserved": {
             "checkpoint": True,
@@ -550,13 +640,14 @@ def create_injection(
             "wandbArguments": True,
         },
         "checkpointWrite": {
-            "enabled": checkpoint_save_dir is not None,
-            "saveDir": checkpoint_save_dir,
-            "exclusiveConfirmed": confirm_checkpoint_exclusive,
+            "enabled": effective_checkpoint_save_dir is not None,
+            "saveDir": effective_checkpoint_save_dir,
+            # Retained as a constant only for training-injection/v1 readers.
+            "exclusiveConfirmed": False,
         },
         "checkpointLoad": {
-            "enabled": checkpoint_load_dir is not None,
-            "loadDir": checkpoint_load_dir,
+            "enabled": effective_checkpoint_load_dir is not None,
+            "loadDir": effective_checkpoint_load_dir,
             "trackerFilename": "latest_checkpointed_iteration.txt",
             "selection": "megatron-tracker",
             "requiredForRecovery": require_resumable_checkpoint,
@@ -594,12 +685,17 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm-checkpoint-exclusive",
         action="store_true",
-        help="confirm no other training job writes CKPT_SAVE_DIR",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--require-resumable-checkpoint",
         action="store_true",
         help="require a strict committed checkpoint suitable for recovery",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="start without loading a checkpoint in a new run archive",
     )
     return parser
 
@@ -616,8 +712,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             training_cwd=args.training_cwd,
             master_port=args.master_port,
             allow_topology_change=args.allow_topology_change,
-            confirm_checkpoint_exclusive=args.confirm_checkpoint_exclusive,
             require_resumable_checkpoint=args.require_resumable_checkpoint,
+            fresh_start=args.fresh,
         )
     except (InjectionError, OSError, UnicodeError) as error:
         print(f"STOP: training parameter injection failed: {error}", file=sys.stderr)
@@ -629,9 +725,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the checkpoint is compatible and no other job writes its save directory.",
             file=sys.stderr,
         )
-    if manifest.get("checkpointWrite", {}).get("enabled") is True:
+    if manifest.get("launchMode") == "fresh":
         print(
-            "CHECKPOINT AUDIT: caller confirmed exclusive writes to "
+            "FRESH START: a create-only worker archive will be prepared at "
+            f"{manifest['runtime']['archiveRoot']}.",
+            file=sys.stderr,
+        )
+    elif manifest.get("checkpointWrite", {}).get("enabled") is True:
+        print(
+            "CHECKPOINT WRITE: enabled at "
             f"{manifest['checkpointWrite']['saveDir']}.",
             file=sys.stderr,
         )

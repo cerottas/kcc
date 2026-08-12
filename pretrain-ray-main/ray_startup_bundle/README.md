@@ -10,7 +10,7 @@
 → 生成并验证 RankTable
 → 原生 HCCL AllReduce
 → 为每个 worker 复制并注入正式训练脚本
-→ Ray 整机 actor 并发启动各节点 torchrun
+→ Ray Jobs API 托管 driver，再由整机 actor 并发启动各节点 torchrun
 ```
 
 `raycluster.yaml` 是基础模板，每个 worker 当前申请整机 8 张 NPU。主入口会
@@ -19,48 +19,162 @@
 
 ## 一行启动
 
+启动前可单独检查目标节点及其 NPU 是否健康、空闲；该命令不会创建 Ray 资源：
+
 ```bash
-cd /home/ywj/pretrain-ray-platform/ray_startup_bundle
-PYTHONUNBUFFERED=1 ./start_ray.py \
-  --allow-topology-change \
-  --confirm-checkpoint-exclusive
+kcc_ray check
 ```
 
-当前默认节点是 `110.129.0.20/22`（2 台），而正式模板声明 `NNODES=6`，
-所以示例必须显式确认拓扑变化。若提交的节点数与源脚本一致，不需要该参数。
+不传 `--node` 时检查 `config/cluster.yaml` 中的
+`topology.activeNodes + topology.spareNodes`；显式传入
+`--node` 时只检查指定节点。
+
+```bash
+kcc_ray start --run-id pretrain-150m-20260803
+```
+
+普通 `start` 默认创建独立的 Kubernetes Supervisor Job 后立即返回；Job 内仍运行
+现有恢复监督器：`activeNodes` 训练、`spareNodes` 备用，保留训练脚本中的 `--load`
+和 checkpoint 路径。每个 active worker 仍由现有 RayCluster 和训练 actor 申请
+整机 8 张 NPU。正式训练 driver 由 Ray Jobs API 托管，不再依赖
+长时间 `kubectl exec` 会话。外层 Job 固定在 `supervisor.node` 配置的机器上，
+并复用该机持久状态目录。
+
+如果希望配置中的 active/spare 节点全部参与训练，使用 `--all-nodes`。Python 入口会
+从同一配置展开现有单次六阶段流程的节点列表；此模式没有备用节点：
+
+```bash
+kcc_ray start --all-nodes
+```
+
+需要从 iteration 0 重新训练时，显式使用现有 fresh 模式：
+
+```bash
+kcc_ray start --fresh --run-id qwen3-from-zero-001
+```
+
+fresh 不修改提交的源脚本。HCCL 通过且 worker 预检完成后，rank 0 在共享
+`/mnt/models` 上 create-only 创建：
+
+```text
+/mnt/models/pretrain-ray-platform/archive/qwen3-from-zero-001/
+├── checkpoints/
+└── logs/
+    ├── node-rank-<N>.log
+    ├── ray-driver/node-rank-<N>/
+    ├── wandb/
+    └── tensorboard/
+```
+
+同名目录已存在时直接停止，不会覆盖或复用。注入副本的 `--load` 和
+`--exit-on-missing-checkpoint` 会移除，`--save` 会指向新归档的
+`checkpoints/`。fresh 运行不进入基于已有 checkpoint 的备用机恢复监督器。
+`--fresh` 可以与 `--all-nodes` 组合，让全部配置节点从 iteration 0 开始；
+`--all-nodes` 不能再与显式 `--node` 混用。
+
+运行中可从另一终端执行：
+
+```bash
+kcc_ray status --run-id <本次逻辑-run-id>
+kcc_ray logs --run-id <本次逻辑-run-id>
+kcc_ray logs --run-id <本次逻辑-run-id> --supervisor
+kcc_ray cancel --run-id <本次逻辑-run-id>
+```
+
+原有停止命令仍可使用：
+
+```bash
+kcc_ray stop --run-id <本次逻辑-run-id>
+kcc_ray stop-after-checkpoint --run-id <本次逻辑-run-id>
+```
+
+`stop` 先写 create-only 停止标记；RayCluster 已存在时核对 run-id 和 UID 后删除，
+尚处于前置阶段时则由 Supervisor 在下一阶段边界安全退出。
+`stop-after-checkpoint` 先记录当前 tracker，只在所有 worker 一致看到更大的正整数
+iteration 后执行同一停止。后者保持前台等待，`Ctrl-C` 仅取消 watcher。停止工具
+只读取 checkpoint，不移动、改名或删除任何 checkpoint；停止标记确保 Supervisor
+不再启用备用机或创建下一 attempt。
+
+项目根目录的 `config/cluster.yaml` 是日常运行默认值的唯一入口。当前完整结构为：
+
+```yaml
+schemaVersion: kcc-ray-config/v1
+kubernetes:
+  kubectlCommand: /usr/local/bin/k3s kubectl
+  kubeconfig: /home/ywj/.kube/k3s-learning.yaml
+  namespace: pretrain-ray
+  clusterName: pretrain-gpu00-gpu01
+topology:
+  headNode: server-00
+  activeNodes:
+    - gpu-server-00
+    - gpu-server-01
+    - gpu-server-02
+    - gpu-server-03
+    - gpu-server-05
+    - gpu-server-06
+  spareNodes: [gpu-server-07, gpu-server-08]
+npuCheck:
+  resourceName: huawei.com/Ascend910
+  exporterNamespace: npu-exporter
+  exporterApp: npu-exporter
+  exporterPort: 8082
+training:
+  defaultTemplate: ../ray_startup_bundle/training_templates/pretrain_150M.sh
+  workingDirectory: /mnt/models/CODE/MindSpeed-LLM-v2.3.0
+supervisor:
+  node: server-00
+  serviceAccount: pretrain-ray-supervisor
+  image: 110.120.0.3:8889/pretrain/ray-head@sha256:121fff1a4b0f991121ba7dc85cbb7a77643d28c79cc355ba3f1536abb51c865b
+  imagePullPolicy: IfNotPresent
+  kubectlHostPath: /usr/local/bin/k3s
+  backoffLimit: 3
+  finishedTtlSeconds: 604800
+timeouts:
+  rayStartupSeconds: 1800
+  hcclGateSeconds: 3600
+  trainingSeconds: 0
+  failedResourceRetentionSeconds: 1800
+  recoveryCleanupSeconds: 300
+```
+
+`check` 和 `--all-nodes` 都由两组节点派生，不再维护额外列表。外层 Supervisor Job 会把创建时
+解析出的运行值写成显式参数并纳入参数摘要；Job Pod 重启继续使用已冻结参数，不会
+重新读取已修改的 YAML。显式 CLI 参数优先于 YAML，只影响本次调用。如需使用系统
+配置，可设置 `KCC_RAY_CONFIG=/etc/kcc-ray/cluster.yaml`；相对路径相对该 YAML 所在
+目录解析。
+
+模型结构、数据与 tokenizer 路径、checkpoint 读写路径、batch size、学习率和保存
+间隔不放在这个文件中，仍只修改 `training.defaultTemplate` 指向的训练模板。Ray
+容器镜像、CPU/内存/NPU 数量、挂载和 runtimeClass 仍只修改 `raycluster.yaml`，
+避免同一训练含义出现两份配置。
 
 每次机器数不同时重复传 `--node` 即可，worker 数由节点列表自动得出：
 
 ```bash
-./start_ray.py \
-  --node gpu-server-02 \
-  --node gpu-server-07 \
-  --node gpu-server-08 \
-  --allow-topology-change \
-  --confirm-checkpoint-exclusive
-```
-
-`--node` 同时接受 Kubernetes 节点名和 InternalIP。基础 YAML 不需要为每次
-训练手工修改。
-
-## 两台备用机的故障恢复入口
-
-需要自动换机时改用 `recovery_supervisor.py`。它复用 `start_ray.py` 的全部
-启动参数；前 6 个 `--node` 是本次 active，两个 `--spare-node` 是备用池：
-
-```bash
-PYTHONUNBUFFERED=1 ./recovery_supervisor.py \
-  --run-id pretrain-150m-20260803 \
-  --node gpu-server-00 \
-  --node gpu-server-01 \
+kcc_ray start \
   --node gpu-server-02 \
   --node gpu-server-03 \
-  --node gpu-server-04 \
   --node gpu-server-05 \
-  --spare-node gpu-server-06 \
   --spare-node gpu-server-07 \
-  --confirm-checkpoint-exclusive
+  --spare-node gpu-server-08
 ```
+
+恢复模式下，显式 `--node` 是 active 列表，显式 `--spare-node` 是不重叠的
+备用池。二者同时接受 Kubernetes 节点名和 InternalIP。基础 YAML 不需要为每次
+训练手工修改。
+
+## start 默认启用两台备用机恢复
+
+统一入口只负责用 `supervisor_job.py` 创建外层 Job；Job 内再调用现有
+`recovery_supervisor.py --resume`，不重新实现六阶段或恢复逻辑。配置中的
+`activeNodes` 是本次 active，`spareNodes` 是备用池：
+
+```bash
+kcc_ray start --run-id pretrain-150m-20260803
+```
+
+显式传入重复的 `--node` 或 `--spare-node` 会分别临时覆盖对应默认列表。
 
 `--run-id` 在这里是逻辑任务 ID；实际每轮证据使用
 `<run-id>-a00`、`<run-id>-a01`。正式训练明确导出 `FAIL` 后，恢复入口会：
@@ -133,15 +247,30 @@ log/training-jobs/<run-id>/state.json
 默认正式模板是：
 
 ```text
-training_templates/pretrain_150M-22.sh
+training_templates/pretrain_150M.sh
 ```
 
-它基于 `/home/ywj/qwen3/pretrain_150M-22.sh`，原脚本不会被修改；当前模板
-采用 6 台、每台 8 张 NPU、`GBS=96` 的正式基线。也可以显式提交另一份同结构脚本：
+当前默认模板采用 6 台、每台 8 张 NPU、`GBS=96` 的正式基线。也可以显式提交
+安装目录内另一份同结构脚本：
 
 ```bash
-./start_ray.py --train-script /path/to/train.sh
+kcc_ray start \
+  --train-script /opt/kcc/pretrain-ray-main/ray_startup_bundle/training_templates/custom.sh
 ```
+
+`--train-script PATH` 就是单次模板选择命令；不传时使用
+`training.defaultTemplate`，当前为 `training_templates/pretrain_150M.sh`。
+
+默认恢复任务首次启动时，会在
+`log/training-jobs/<run-id>/training-template.sh` create-only 保存所选模板快照，
+并把来源路径、快照路径、大小和 SHA256 写入 `state.json` 及同目录元数据文件。
+当前 attempt、备用机恢复 attempt 和 Supervisor Pod 重启都只使用这个快照；源模板
+之后被修改不会改变该 logical run。快照或元数据缺失、被替换、使用符号链接或摘要
+不一致时会安全停止。升级前没有模板快照的旧 state 不会被自动接管。
+
+Supervisor Job 只能读取项目挂载中的控制侧文件，因此自定义训练脚本、manifest、
+runtime 和 HCCL 证据文件必须位于实际安装目录（例如 `/opt/kcc/pretrain-ray-main`）下；worker 内的
+训练目录和 `/mnt/models` 数据路径不受这个限制。
 
 默认训练工作目录是 worker 内已经验证过的：
 
@@ -164,17 +293,20 @@ HCCL 成功后，`inject_training_params.py` 根据本次证据为每个 worker 
 - 未注释的 `torchrun`，改为
   `/root/miniconda3/envs/ms/bin/torchrun`
 
+仅当显式使用 `--fresh` 时，还会在注入副本中把 checkpoint 和日志参数改到
+本次 archive，并移除活动的 `--load`、`--exit-on-missing-checkpoint`；源脚本
+始终不变。
+
 `MASTER_PORT` 默认保留源脚本值，可用 `--master-port` 覆盖。
 
 如果 HCCL 发现的 `NNODES × NPUS_PER_NODE` 与源脚本不同，注入阶段默认停止，
 不会启动训练。缩容或扩容必须由用户显式传入
 `--allow-topology-change`；该确认会写入 `injection.json`，供前端审计。
-确认前需要同时核对 checkpoint 是否支持新 world size，并确保
-`CKPT_SAVE_DIR` 没有被另一训练任务写入。现有 legacy Shell 任务没有统一锁，
-因此这一项只能由提交者通过 `--confirm-checkpoint-exclusive` 确认；确认值和
-目录会写入 `injection.json`。平台不会擅自改 checkpoint 目录。
+改变拓扑前需要同时核对 checkpoint 是否支持新 world size，并确保
+`CKPT_SAVE_DIR` 没有被另一训练任务写入。工具不再要求无实际互斥能力的人工确认参数，
+也不提供跨任务 checkpoint 写锁；平台不会擅自改 checkpoint 目录。
 
-以下正式训练语义不会被改写：
+普通续训模式下，以下正式训练语义不会被改写：
 
 - `TRAIN_ITERS` 及模型、并行、batch、学习率参数
 - 数据路径与数据缓存参数
@@ -187,7 +319,15 @@ HCCL 成功后，`inject_training_params.py` 根据本次证据为每个 worker 
 
 ## 文件职责
 
-- `start_ray.py`：唯一正式主入口；顺序执行六个阶段，任一阶段失败即停止后续阶段。
+- `config/cluster.yaml`：唯一的日常运行默认配置；不存训练超参数和密钥。
+- `cluster_config.py`：有界、安全加载严格 schema，并派生本次有效默认值。
+- `bin/kcc_ray`：统一用户入口；默认 `start` 接入恢复监督，`--all-nodes`
+  接入全部配置节点的单次流程，`--fresh` 接入从零训练实现。
+- `supervisor_job.py`：create-only 创建并校验固定 RayCluster 对应的外层
+  Kubernetes Job，提供状态和 Supervisor 日志查询。
+- `supervisor-rbac.yaml`：按 namespace/cluster 渲染的外层 Job ServiceAccount、
+  集群内 kubeconfig 与最小 Kubernetes 权限模板；不要绕过入口直接 apply。
+- `start_ray.py`：单次六阶段内部入口；第 6 阶段通过 Ray Jobs API 提交 driver。
 - `environment_check.py`：只读检查 Kubernetes NPU 占用、硬件健康和 NPU
   进程；发现占用时打印原因并退出，不停止别人的进程。
 - `ray_cluster_start.py`：打包 HCCL runtime、应用 YAML、等待 Ray 就绪。
@@ -195,31 +335,37 @@ HCCL 成功后，`inject_training_params.py` 根据本次证据为每个 worker 
   生成对应副本数和 affinity 的运行 YAML。
 - `hccl_gate.py`、`hccl_runtime/`：拓扑发现、RankTable 和真实 HCCL gate。
 - `inject_training_params.py`：读取 PASS 证据，创建每节点正式脚本和冻结清单。
-- `ray_training_submit.py`：把清单、脚本和 driver 复制到 Ray head 并提交。
+- `ray_training_submit.py`：把清单与 driver 复制到 Ray head，并用 Ray Jobs API 提交、查询和导出结果。
 - `ray_training_driver.py`：每个 worker 申请其全部 NPU，核对 Pod/RankTable/
   `ms` 环境后并发执行正式脚本。
 - `recovery_supervisor.py`：失败清理、单次诊断、备用机计数、整批替换和重启。
 - `recovery_diagnostics.py`：一次性读取 Kubernetes/exporter 证据并给出
   fail-closed 的 N 坏机换 N 备用机决策。
-- `training_templates/`：正式脚本副本；不修改 `/home/ywj/qwen3` 原文件。
-- `raycluster.yaml`：当前两节点 Ray 部署及镜像、挂载、资源声明。
+- `training_templates/`：正式训练模板；运行时只修改生成的注入副本。
+- `raycluster.yaml`：按 namespace/cluster/head/NPU/worker 列表渲染的 Ray 基础模板，
+  也是镜像、挂载和资源声明的唯一来源；不要绕过入口直接 apply。
 
 仓库旧的 `scripts/start_ray.py` 两阶段入口已经删除，避免误用旧 smoke
-manifest。正式训练统一从本目录的 `start_ray.py` 启动。
+manifest。正式训练统一从 `kcc_ray start` 启动，内部仍复用本目录已有模块。
 
-旧训练 smoke、测试、历史产物和报告已迁移到同级工作区
-`/home/ywj/pretrain-ray-platform-workspace-archive/`，不会进入 launcher
-镜像。HCCL 代码中的 `ranktable_smoke` 是通信验证证据类型，不是旧训练
-smoke。
+运行日志、测试归档、历史产物和报告不属于运行工具，不应进入发行包。HCCL 代码中的
+`ranktable_smoke` 是通信验证证据类型，不是旧训练 smoke。
 
 ## 证据、日志与资源生命周期
 
-每次运行自动生成唯一 `run-id`。主要本地结果为：
+单次续训或 fresh 运行自动生成唯一 `run-id`。主要本地结果为：
 
 ```text
 log/hccl-startup/<run-id>/
 log/training-runs/<run-id>/injection/
 log/training-runs/<run-id>/execution-result.json
+```
+
+默认 `start` 把 `--run-id` 作为逻辑任务 ID，各轮结果使用
+`<run-id>-a00`、`<run-id>-a01`，监督状态另存为：
+
+```text
+log/training-jobs/<run-id>/state.json
 ```
 
 这些控制端目录应挂载持久卷。worker 上的正式训练日志统一写入共享
@@ -230,13 +376,21 @@ log/training-runs/<run-id>/execution-result.json
 /mnt/models/pretrain-ray-platform/log/<run-id>/ray-driver/node-rank-<N>/
 ```
 
+fresh 模式改为写入同一存档目录：
+
+```text
+/mnt/models/pretrain-ray-platform/archive/<run-id>/checkpoints/
+/mnt/models/pretrain-ray-platform/archive/<run-id>/logs/
+```
+
 成功时默认删除 RayCluster 以释放 NPU，但保留 checkpoint、训练日志和本地
 证据。使用 `--keep-success-resources` 可保留 RayCluster。
 
-Ray 启动、HCCL 或训练失败时，已确认的失败资源默认保留 1800 秒后删除
-RayCluster；Namespace、checkpoint 和日志不会删除。使用
-`--failure-retention-seconds 0` 可立即清理，使用 `-1` 可永久保留。如果
-训练状态不确定或结果未能导出，RayCluster 会保留，避免误删仍在运行的任务。
+`--all-nodes` 单次续训或 fresh 运行在 Ray 启动、HCCL 或训练明确失败时，默认
+保留资源 1800 秒后删除 RayCluster；可用 `--failure-retention-seconds` 调整。
+默认 `start` 为了先清理旧 world 再诊断换机，会把失败保留时间强制为 0。
+Namespace、checkpoint 和日志不会删除。训练状态不确定或结果未能导出时，
+RayCluster 会保留，避免误删仍在运行的任务。
 
 需要提前删除时，可中断等待进程后执行：
 
@@ -247,14 +401,20 @@ RayCluster；Namespace、checkpoint 和日志不会删除。使用
   -n pretrain-ray --wait=false
 ```
 
-当前 `ray_training_submit.py` 是前台等待式 CLI：训练期间启动进程需要持续运行。
-Ctrl-C 或控制链路断开时不会猜测训练状态，也不会删除 checkpoint，RayCluster
-会留在现场供检查。接入前端时应由持久化的后端任务进程托管该 CLI；将提交
-进一步改成可重连的 Ray Job 是后续 TODO，不影响当前 actor 拉起训练的路径。
+当前第 6 阶段通过 `ray_training_submit.py` 把 driver 提交给 Ray Jobs API。
+提交成功后，driver 不依赖原终端；控制链路中断时不会删除 checkpoint 或状态不明的
+RayCluster。恢复 Supervisor 由固定在 `supervisor.node` 的 Kubernetes Job 托管；
+`kcc_ray status` 聚合外层 Job、恢复状态和内层 Ray Job，`logs --supervisor` 查看
+外层日志。Pod 重启时内部自动带 `--resume`；手工执行 `kcc_ray start --resume` 时还会
+核对相同 run ID、参数摘要和 Job ownership。进程锁保证同一逻辑任务只有一个接管者；
+已有结果会被验证并重放，否则只重连 create-only record 中的原 Ray Job。没有可信
+record 时不会重跑六阶段或重复 submit。
+Ray Job 状态默认每 30 秒查询一次；短暂失败按 5、10、20、30 秒退避，连续
+失败超过 300 秒才按状态不确定退出并保留 RayCluster。
 
 ## 为前端预留
 
-前端只需调用 `start_ray.py` 对应的后端 API，不需要了解 Kubernetes、
+前端只需调用 `kcc_ray start` 对应的持久化后端任务，不需要了解 Kubernetes、
 RankTable 或 HCCL。已经预留的提交字段包括：
 
 - 训练脚本、训练工作目录
@@ -262,7 +422,8 @@ RankTable 或 HCCL。已经预留的提交字段包括：
 - 期望 worker/world size
 - master port
 - 是否明确同意改变源脚本拓扑（缩容/扩容）
-- 是否确认 checkpoint 保存目录没有其他 writer
+- 启动模式（默认恢复续训、`--all-nodes` 全节点单次训练或 `--fresh` 从零开始）；
+  fresh 的 archive 路径与恢复备用节点列表
 - 各阶段 timeout、失败资源保留时间
 - caller 提供的 run ID
 - 成功后是否保留 RayCluster

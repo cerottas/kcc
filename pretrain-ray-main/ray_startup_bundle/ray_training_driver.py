@@ -29,6 +29,7 @@ ACTOR_PREFLIGHT_TIMEOUT_SECONDS = 300
 RANK_TABLE_PATH = "/user/serverid/devindex/config/hccl.json"
 MS_TORCHRUN = "/root/miniconda3/envs/ms/bin/torchrun"
 CHECKPOINT_TRACKER = "latest_checkpointed_iteration.txt"
+FRESH_ARCHIVE_ROOT = "/mnt/models/pretrain-ray-platform/archive"
 PROCESS_SUPERVISOR = r"""
 import ctypes
 import os
@@ -103,6 +104,17 @@ def sha256_file(path: Path) -> str:
 def require_file(path: Path, label: str) -> None:
     if not path.is_file() or path.is_symlink():
         raise DriverError(f"{label} is not a regular file: {path}")
+
+
+def validate_ranktable_mount(path: Path, expected_sha256: str) -> str:
+    # Kubernetes projects ConfigMap keys as kubelet-managed symlinks.  Follow
+    # that link, then pin the mounted bytes to the HCCL-validated digest.
+    if not path.is_file():
+        raise RuntimeError(f"RankTable is not a regular file: {path}")
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError("mounted RankTable digest differs from HCCL evidence")
+    return actual_sha256
 
 
 def require_mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -266,6 +278,26 @@ def ensure_matching_checkpoint_views(
         raise CheckpointError("active workers see different checkpoint snapshots")
 
 
+def create_fresh_archive(archive_root: Path) -> str:
+    archive_root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        archive_root.mkdir(exist_ok=False)
+        (archive_root / "checkpoints").mkdir()
+        logs_dir = archive_root / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "wandb").mkdir()
+        (logs_dir / "tensorboard").mkdir()
+    except FileExistsError as error:
+        raise DriverError(
+            f"fresh archive already exists; choose a new run ID: {archive_root}"
+        ) from error
+    except OSError as error:
+        raise DriverError(
+            f"cannot create fresh archive {archive_root}: {error}"
+        ) from error
+    return str(archive_root)
+
+
 def load_injection(
     injection_path: Path,
     scripts_dir: Path,
@@ -285,6 +317,9 @@ def load_injection(
     run_id = injection.get("runId")
     if not isinstance(run_id, str) or RUN_ID_PATTERN.fullmatch(run_id) is None:
         raise DriverError("injection runId is invalid")
+    launch_mode = injection.get("launchMode", "resume")
+    if launch_mode not in {"resume", "fresh"}:
+        raise DriverError("injection launch mode is invalid")
 
     topology = require_mapping(injection.get("topology"), "topology")
     worker_count = topology.get("workers")
@@ -316,7 +351,16 @@ def load_injection(
         raise DriverError("training cwd is not an absolute worker path")
     if runtime.get("torchrun") != MS_TORCHRUN:
         raise DriverError("injection does not select the ms torchrun")
-    expected_log_root = f"/mnt/models/pretrain-ray-platform/log/{run_id}"
+    if launch_mode == "fresh":
+        expected_archive_root = f"{FRESH_ARCHIVE_ROOT}/{run_id}"
+        expected_log_root = f"{expected_archive_root}/logs"
+        if runtime.get("archiveRoot") != expected_archive_root:
+            raise DriverError("fresh archive root is not the run-specific path")
+    else:
+        expected_archive_root = None
+        expected_log_root = f"/mnt/models/pretrain-ray-platform/log/{run_id}"
+        if runtime.get("archiveRoot") not in (None,):
+            raise DriverError("resume injection unexpectedly defines an archive root")
     if runtime.get("logRoot") != expected_log_root:
         raise DriverError("injection log root is not the run-specific path")
 
@@ -336,7 +380,6 @@ def load_injection(
         raise DriverError("checkpointLoad enable/require flags are invalid")
     if checkpoint_required and not checkpoint_enabled:
         raise DriverError("formal recovery injection has checkpoint loading disabled")
-
     raw_nodes = injection.get("nodes")
     if not isinstance(raw_nodes, list) or len(raw_nodes) != worker_count:
         raise DriverError("injection node count differs from the topology")
@@ -396,6 +439,12 @@ def load_injection(
             MS_TORCHRUN,
             f'LOG_FILE="{expected_log_root}/logs/node-rank-{node_rank}.log"',
         )
+        if launch_mode == "fresh":
+            required_fragments = (
+                *required_fragments[:-1],
+                f'LOG_FILE="{expected_log_root}/node-rank-{node_rank}.log"',
+                f'CKPT_SAVE_DIR="{expected_archive_root}/checkpoints"',
+            )
         missing = [fragment for fragment in required_fragments if fragment not in script]
         if missing:
             raise DriverError(
@@ -462,14 +511,6 @@ def execute_on_ray(
             return identity
 
         @staticmethod
-        def _sha256(path: Path) -> str:
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return digest.hexdigest()
-
-        @staticmethod
         def _terminate_process_group(
             process: subprocess.Popen[str],
             *,
@@ -530,11 +571,9 @@ def execute_on_ray(
             ):
                 raise RuntimeError(f"ms torchrun is not executable: {torchrun}")
             ranktable = Path(str(topology["rankTablePath"]))
-            if not ranktable.is_file() or ranktable.is_symlink():
-                raise RuntimeError(f"RankTable is not a regular file: {ranktable}")
-            actual_ranktable_sha256 = self._sha256(ranktable)
-            if actual_ranktable_sha256 != topology["rankTableSha256"]:
-                raise RuntimeError("mounted RankTable digest differs from HCCL evidence")
+            actual_ranktable_sha256 = validate_ranktable_mount(
+                ranktable, str(topology["rankTableSha256"])
+            )
             npus_per_worker = int(topology["npusPerWorker"])
             missing_devices = [
                 str(Path("/dev") / f"davinci{device_id}")
@@ -559,6 +598,12 @@ def execute_on_ray(
                 "rankTableSha256": actual_ranktable_sha256,
                 "npuDevices": npus_per_worker,
             }
+
+        def prepare_fresh_archive(
+            self,
+            archive_root: str,
+        ) -> str:
+            return create_fresh_archive(Path(archive_root))
 
         def checkpoint_preflight(
             self,
@@ -676,6 +721,7 @@ def execute_on_ray(
     topology = require_mapping(injection.get("topology"), "topology")
     runtime = require_mapping(injection.get("runtime"), "runtime")
     run_id = str(injection["runId"])
+    launch_mode = str(injection.get("launchMode", "resume"))
     worker_count = int(topology["workers"])
     npus_per_worker = int(topology["npusPerWorker"])
     actors: list[Any] = []
@@ -748,6 +794,28 @@ def execute_on_ray(
                 "checkpoint": {"status": "NOT_CHECKED"},
                 "nodes": [],
             }
+        if launch_mode == "fresh":
+            archive_root = str(runtime["archiveRoot"])
+            try:
+                ray.get(
+                    ordered_actors[0].prepare_fresh_archive.remote(
+                        archive_root,
+                    ),
+                    timeout=ACTOR_PREFLIGHT_TIMEOUT_SECONDS,
+                )
+            except Exception as error:
+                return {
+                    "schemaVersion": "ray-training-result/v1",
+                    "runId": run_id,
+                    "status": "FAIL",
+                    "failureClass": "WORKER_RUNTIME_FAILURE",
+                    "failurePhase": "fresh-archive-preparation",
+                    "failure": f"{type(error).__name__}: {error}",
+                    "topology": dict(topology),
+                    "preflights": preflights,
+                    "checkpoint": {"status": "NOT_CHECKED"},
+                    "nodes": [],
+                }
         checkpoint_policy = require_mapping(
             injection.get("checkpointLoad"),
             "checkpointLoad",
@@ -898,6 +966,7 @@ def execute_on_ray(
                 "status": "DISABLED",
                 "policy": dict(checkpoint_policy),
             }
+
         run_refs: dict[Any, tuple[Any, Mapping[str, Any]]] = {}
         for actor, node in zip(ordered_actors, ordered_nodes):
             pod_name = str(node["podName"])

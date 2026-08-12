@@ -1,14 +1,21 @@
 #!/bin/bash
-# Source template: /home/ywj/qwen3/pretrain_150M-22.sh (credential comments omitted)
 #  wandb登录
 # pip list | grep wandb
 # 如果<0.24要升级：
-#  pip install -U wandb 
+#  pip install -U wandb
 # wandb login
 # pip install tensorboard
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+# 加载 Worker 镜像内已有的 CANN 与 NNAL/ATB 环境。
+source /usr/local/Ascend/cann/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/cann/nnal/atb/set_env.sh
+if [[ -z "${ATB_HOME_PATH:-}" || ! -d "${ATB_HOME_PATH}/lib" ]]; then
+    echo "ERROR: NNAL/ATB environment is unavailable: ATB_HOME_PATH=${ATB_HOME_PATH:-unset}" >&2
+    exit 1
+fi
 
 # 多机训练必须设置RANK_TABLE_FILE
 export RANK_TABLE_FILE=/mnt/models/CODE/wh/MindSpeed-LLM-v2.3.0/examples/mcore/qwen3/rank_table_generated.json
@@ -24,12 +31,14 @@ NNODES=6
 NODE_RANK=5
 WORLD_SIZE=$(($NPUS_PER_NODE*$NNODES))
 
-CKPT_SAVE_DIR="/mnt/models/0717"
-CKPT_LOAD_DIR="/mnt/models/0717"
+CKPT_SAVE_DIR="/mnt/models/00_TRAIN_RES/0717"
+CKPT_LOAD_DIR="/mnt/models/00_TRAIN_RES/0717"
 LOG_FILE="logs/0717.log"
 
 WANDB_PROJECT="0701"
 WANDB_EXPERIMENT="cpm_minidata_150M-gbs96-mix"
+# W&B 当前未传入训练命令；启用时从 Secret/运行环境提供 WANDB_API_KEY。
+export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 TOKENIZER_PATH="/mnt/models/MODELS/MiniCPM"
 # TOKENIZER_PATH="/mnt/models/TOKENIZER_GEN/tokenizer_sp_200k"
 
@@ -58,8 +67,8 @@ PP=1
 MBS=2
 GBS=96
 SEQ_LENGTH=4096
-# TRAIN_ITERS=300000  
-# LR_WARMUP_ITERS=3000  
+# TRAIN_ITERS=300000
+# LR_WARMUP_ITERS=3000
 
 TRAIN_ITERS=$(( TOKENS_NUM / (GBS * SEQ_LENGTH) ))
 echo $TRAIN_ITERS
@@ -96,9 +105,9 @@ WSD_DECAY_ITERS=$(( TRAIN_ITERS / 10 ))
 # )
 
 DATA_DIRS=(
-    "CPM/ultrafineweb-en-l3" 
-    "CPM/ultrafineweb-zh-l3-multistyle"
-    "CPM/ultrafineweb-zh-l3"
+    "ultrafineweb-en-l3"
+    "ultrafineweb-zh-l3-multistyle"
+    "ultrafineweb-zh-l3"
 )
 
 
@@ -108,7 +117,7 @@ DATA_DIRS=(
 # DIR_WEIGHTS=("0.086" "0.675" "0.134" "0.104" )
 DIR_WEIGHTS=( "0.675" "0.134" "0.104" )
 # #DATA_DIRS=("c4-bin" "finepdfs-bin" "quality-bin" "ChineseWebText-bin" "zh_baike-bin"  "zh_papers-bin" )
-BASE_DATA_DIR="/mnt/models/DATA_BIN"
+BASE_DATA_DIR="/mnt/models/DATA_BIN/GEN"
 DATA_PATH=""
 for i in "${!DATA_DIRS[@]}"; do
     d="${DATA_DIRS[$i]}"
@@ -230,13 +239,7 @@ OUTPUT_ARGS="
     --eval-iters 0 \
 "
 
-WANDB_ARGS="
-    --use-wandb \
-    --wandb-project ${WANDB_PROJECT} \
-    --wandb-exp-name ${WANDB_EXPERIMENT} \
-    --wandb-save-dir wandb_logs \
-    --tensorboard-dir tensorboard_logs \
-" 
+WANDB_ARGS=""  # W&B 暂时屏蔽，先测试训练与恢复
 
 # nohup torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
 #     $GPT_ARGS \

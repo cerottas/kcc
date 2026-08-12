@@ -4,22 +4,35 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Mapping, Sequence
+
+import cluster_config
 
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 DRIVER_PATH = BUNDLE_DIR / "ray_training_driver.py"
-DEFAULT_KUBECONFIG = Path("/home/ywj/.kube/k3s-learning.yaml")
+REMOTE_HELPER_PATH = BUNDLE_DIR / "ray_job_remote.py"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+REMOTE_PYTHON = "/home/ray/anaconda3/bin/python"
+JOB_RESPONSE_SCHEMA = "kcc-ray-job-api/v1"
+SUBMISSION_RECORD_SCHEMA = "kcc-ray-job-submission/v1"
+SUBMISSION_RECORD_FILENAME = "ray-job-submission.json"
+TERMINAL_JOB_STATUSES = frozenset({"SUCCEEDED", "FAILED", "STOPPED"})
+DEFAULT_POLL_SECONDS = 30.0
+DEFAULT_STATUS_RETRY_SECONDS = 300.0
+STATUS_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
 
 
 class SubmitError(RuntimeError):
@@ -96,6 +109,7 @@ def load_injection(
     if ranks != set(range(worker_count)):
         raise SubmitError("injection node ranks are not contiguous")
     require_file(DRIVER_PATH, "Ray training driver")
+    require_file(REMOTE_HELPER_PATH, "Ray Jobs API helper")
     return injection, tuple(scripts)
 
 
@@ -114,8 +128,10 @@ def run_command(
     timeout: int | None,
     check: bool = True,
     print_output: bool = True,
+    print_command: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    print("$ " + shlex.join(command), flush=True)
+    if print_command:
+        print("$ " + shlex.join(command), flush=True)
     try:
         result = subprocess.run(
             list(command),
@@ -181,14 +197,93 @@ def find_ready_head(
     return pod_name
 
 
-def write_result_create_only(path: Path, payload: Mapping[str, Any]) -> None:
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def write_json_create_only(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    linked = False
     try:
-        with path.open("x", encoding="utf-8") as stream:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
             json.dump(payload, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
-    except FileExistsError as error:
-        raise SubmitError(f"refusing to overwrite result: {path}") from error
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError as error:
+            raise SubmitError(f"refusing to overwrite {label}: {path}") from error
+        linked = True
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+        if linked:
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+
+def write_result_create_only(path: Path, payload: Mapping[str, Any]) -> None:
+    write_json_create_only(path, payload, label="result")
+
+
+def load_submission_record(
+    path: Path,
+    *,
+    expected_run_id: str,
+    expected_namespace: str,
+    expected_cluster: str,
+) -> dict[str, Any]:
+    """Load the create-only handoff needed to reattach without resubmitting."""
+    if not path.is_file() or path.is_symlink():
+        raise SubmitError(f"Ray Job submission record is not a regular file: {path}")
+    try:
+        if path.stat().st_size > 64 * 1024:
+            raise SubmitError(f"Ray Job submission record is unexpectedly large: {path}")
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SubmitError(f"cannot read Ray Job submission record: {error}") from error
+
+    expected_remote_dir = f"/tmp/pretrain-ray-submit/{expected_run_id}"
+    if (
+        not isinstance(record, dict)
+        or record.get("schemaVersion") != SUBMISSION_RECORD_SCHEMA
+        or record.get("runId") != expected_run_id
+        or record.get("submissionId") != expected_run_id
+        or record.get("namespace") != expected_namespace
+        or record.get("cluster") != expected_cluster
+        or not isinstance(record.get("headPod"), str)
+        or not record.get("headPod")
+        or record.get("remoteDir") != expected_remote_dir
+        or record.get("remoteHelper")
+        != f"{expected_remote_dir}/{REMOTE_HELPER_PATH.name}"
+        or record.get("remoteResult")
+        != f"{expected_remote_dir}/execution-result.json"
+        or not isinstance(record.get("submittedAt"), str)
+        or not record.get("submittedAt")
+    ):
+        raise SubmitError("Ray Job submission record ownership is invalid")
+    return record
 
 
 def export_result(
@@ -198,7 +293,9 @@ def export_result(
     head_pod: str,
     remote_result: str,
     local_result: Path,
-) -> None:
+    expected_run_id: str,
+    expected_status: str,
+) -> Mapping[str, Any]:
     exported = run_command(
         [
             *kubectl,
@@ -224,7 +321,15 @@ def export_result(
         or payload.get("schemaVersion") != "ray-training-result/v1"
     ):
         raise SubmitError("remote training result has an unsupported schema")
+    if payload.get("runId") != expected_run_id:
+        raise SubmitError("remote training result belongs to another run")
+    if payload.get("status") != expected_status:
+        raise SubmitError(
+            "remote training result status differs from Ray Job status: "
+            f"expected {expected_status}, got {payload.get('status')!r}"
+        )
     write_result_create_only(local_result, payload)
+    return payload
 
 
 def delete_ray_cluster(
@@ -328,6 +433,7 @@ def prepare_remote_submission(
         injection_dir / "injection.json",
         *scripts,
         DRIVER_PATH,
+        REMOTE_HELPER_PATH,
     ]
     for source in transfer_files:
         run_command(
@@ -344,6 +450,361 @@ def prepare_remote_submission(
     return head_pod, remote_dir
 
 
+def remote_helper_command(
+    kubectl: Sequence[str],
+    *,
+    namespace: str,
+    head_pod: str,
+    remote_dir: str,
+    operation: str,
+    arguments: Sequence[str],
+) -> list[str]:
+    return [
+        *kubectl,
+        "exec",
+        "-n",
+        namespace,
+        head_pod,
+        "-c",
+        "ray-head",
+        "--",
+        REMOTE_PYTHON,
+        f"{remote_dir}/{REMOTE_HELPER_PATH.name}",
+        operation,
+        *arguments,
+    ]
+
+
+def parse_job_response(
+    output: str,
+    *,
+    operation: str,
+    submission_id: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise SubmitError(
+            f"Ray Jobs {operation} returned invalid JSON: {error}"
+        ) from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schemaVersion") != JOB_RESPONSE_SCHEMA
+        or payload.get("operation") != operation
+        or payload.get("submissionId") != submission_id
+    ):
+        raise SubmitError(f"Ray Jobs {operation} returned invalid ownership data")
+    return payload
+
+
+def call_job_api(
+    kubectl: Sequence[str],
+    *,
+    namespace: str,
+    head_pod: str,
+    remote_dir: str,
+    operation: str,
+    submission_id: str,
+    extra_arguments: Sequence[str] = (),
+) -> dict[str, Any]:
+    result = run_command(
+        remote_helper_command(
+            kubectl,
+            namespace=namespace,
+            head_pod=head_pod,
+            remote_dir=remote_dir,
+            operation=operation,
+            arguments=(
+                "--submission-id",
+                submission_id,
+                *extra_arguments,
+            ),
+        ),
+        timeout=60,
+        print_output=False,
+        print_command=False,
+    )
+    return parse_job_response(
+        result.stdout,
+        operation=operation,
+        submission_id=submission_id,
+    )
+
+
+def wait_for_ray_job(
+    kubectl: Sequence[str],
+    *,
+    namespace: str,
+    head_pod: str,
+    remote_dir: str,
+    submission_id: str,
+    poll_seconds: float,
+    status_retry_seconds: float = DEFAULT_STATUS_RETRY_SECONDS,
+) -> str:
+    previous: str | None = None
+    failure_deadline: float | None = None
+    retry_index = 0
+    while True:
+        try:
+            payload = call_job_api(
+                kubectl,
+                namespace=namespace,
+                head_pod=head_pod,
+                remote_dir=remote_dir,
+                operation="status",
+                submission_id=submission_id,
+            )
+        except SubmitError as error:
+            now = time.monotonic()
+            if failure_deadline is None:
+                failure_deadline = now + status_retry_seconds
+            remaining = failure_deadline - now
+            if remaining <= 0:
+                raise SubmitError(
+                    "Ray Job status query failed continuously for "
+                    f"{status_retry_seconds:g} seconds: {error}"
+                ) from error
+            delay = min(
+                STATUS_RETRY_BACKOFF_SECONDS[
+                    min(retry_index, len(STATUS_RETRY_BACKOFF_SECONDS) - 1)
+                ],
+                remaining,
+            )
+            retry_index += 1
+            print(
+                "WARNING: Ray Job status query failed; "
+                f"retrying in {delay:g}s: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+            continue
+
+        if failure_deadline is not None:
+            print("RAY JOB: status query recovered", flush=True)
+            failure_deadline = None
+            retry_index = 0
+        status = payload.get("status")
+        if not isinstance(status, str):
+            raise SubmitError("Ray Jobs status response omitted status")
+        status = status.upper()
+        if status != previous:
+            print(f"RAY JOB: submission={submission_id} status={status}", flush=True)
+            previous = status
+        if status in TERMINAL_JOB_STATUSES:
+            return status
+        if status not in {"PENDING", "RUNNING"}:
+            raise SubmitError(f"Ray Job returned unsupported status: {status}")
+        time.sleep(poll_seconds)
+
+
+def print_job_logs(
+    kubectl: Sequence[str],
+    *,
+    namespace: str,
+    head_pod: str,
+    remote_dir: str,
+    submission_id: str,
+) -> None:
+    command = remote_helper_command(
+        kubectl,
+        namespace=namespace,
+        head_pod=head_pod,
+        remote_dir=remote_dir,
+        operation="logs",
+        arguments=("--submission-id", submission_id),
+    )
+    try:
+        result = run_command(command, timeout=120, print_output=False)
+    except SubmitError as error:
+        print(f"WARNING: cannot fetch Ray Job logs: {error}", file=sys.stderr)
+        return
+    if result.stdout:
+        print("=== Ray Job driver logs ===")
+        print(result.stdout.rstrip())
+
+
+def require_owned_ray_cluster(
+    kubectl: Sequence[str],
+    *,
+    namespace: str,
+    cluster: str,
+    expected_run_id: str,
+) -> None:
+    result = run_command(
+        [
+            *kubectl,
+            "get",
+            "raycluster",
+            cluster,
+            "-n",
+            namespace,
+            "-o",
+            "json",
+        ],
+        timeout=30,
+        print_output=False,
+        print_command=False,
+    )
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SubmitError(f"cannot parse RayCluster ownership: {error}") from error
+    metadata = document.get("metadata") if isinstance(document, Mapping) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, Mapping) else None
+    if (
+        not isinstance(document, Mapping)
+        or document.get("kind") != "RayCluster"
+        or not isinstance(metadata, Mapping)
+        or metadata.get("name") != cluster
+        or metadata.get("namespace") != namespace
+        or not isinstance(annotations, Mapping)
+        or annotations.get("trainctl.io/run-id") != expected_run_id
+    ):
+        raise SubmitError("RayCluster ownership differs from the resumed attempt")
+
+
+def finalize_submitted_job(
+    kubectl: Sequence[str],
+    *,
+    namespace: str,
+    cluster: str,
+    run_id: str,
+    head_pod: str,
+    remote_dir: str,
+    remote_result: str,
+    result_path: Path,
+    job_status: str,
+    failure_retention_seconds: int,
+    keep_success_resources: bool,
+) -> None:
+    print_job_logs(
+        kubectl,
+        namespace=namespace,
+        head_pod=head_pod,
+        remote_dir=remote_dir,
+        submission_id=run_id,
+    )
+
+    if job_status == "STOPPED":
+        print(
+            "STOPPED RESOURCE RETENTION: automatic cleanup and result export "
+            "are disabled; use kcc_ray cancel for owned cleanup.",
+            file=sys.stderr,
+        )
+        raise SubmitError(f"Ray Job {run_id} was stopped; no result was trusted")
+
+    export_error: SubmitError | None = None
+    try:
+        export_result(
+            kubectl,
+            namespace=namespace,
+            head_pod=head_pod,
+            remote_result=remote_result,
+            local_result=result_path,
+            expected_run_id=run_id,
+            expected_status="PASS" if job_status == "SUCCEEDED" else "FAIL",
+        )
+    except SubmitError as error:
+        export_error = error
+
+    if job_status != "SUCCEEDED":
+        suffix = (
+            f"; failure result exported to {result_path}"
+            if export_error is None
+            else f"; result export failed: {export_error}"
+        )
+        if export_error is None:
+            retain_then_delete_failed_cluster(
+                kubectl,
+                namespace=namespace,
+                cluster=cluster,
+                retention_seconds=failure_retention_seconds,
+            )
+        else:
+            print(
+                "FAILED RESOURCE RETENTION: result export failed; "
+                "RayCluster is retained indefinitely.",
+                file=sys.stderr,
+            )
+        raise SubmitError(f"Ray Job {run_id} ended with {job_status}{suffix}")
+    if export_error is not None:
+        print(
+            "FAILED RESOURCE RETENTION: successful result could not be exported; "
+            "RayCluster is retained indefinitely.",
+            file=sys.stderr,
+        )
+        raise export_error
+    if keep_success_resources:
+        print("SUCCESS RESOURCE RETENTION: RayCluster was left in place.")
+    else:
+        print(
+            "SUCCESS RESOURCE CLEANUP: deleting the RayCluster; "
+            "all checkpoints and training logs are retained."
+        )
+        delete_ray_cluster(kubectl, namespace=namespace, cluster=cluster)
+    print(f"PASS: training result exported to {result_path}")
+
+
+def resume_existing_submission(
+    *,
+    expected_run_id: str,
+    kubectl_command: str,
+    kubeconfig: Path | None,
+    namespace: str,
+    cluster: str,
+    result_path: Path,
+    failure_retention_seconds: int,
+    poll_seconds: float,
+    keep_success_resources: bool,
+) -> None:
+    """Reattach to a recorded Ray Job; this path never submits a new job."""
+    if result_path.exists() or result_path.is_symlink():
+        raise SubmitError(f"refusing to overwrite result: {result_path}")
+    record = load_submission_record(
+        result_path.with_name(SUBMISSION_RECORD_FILENAME),
+        expected_run_id=expected_run_id,
+        expected_namespace=namespace,
+        expected_cluster=cluster,
+    )
+    kubectl = kubectl_prefix(kubectl_command, kubeconfig)
+    require_owned_ray_cluster(
+        kubectl,
+        namespace=namespace,
+        cluster=cluster,
+        expected_run_id=expected_run_id,
+    )
+    current_head = find_ready_head(kubectl, namespace=namespace, cluster=cluster)
+    if current_head != record["headPod"]:
+        raise SubmitError(
+            "ready Ray head differs from the recorded submission head; "
+            "Ray Job ownership is uncertain"
+        )
+
+    print(f"RAY JOB: reattached {expected_run_id}", flush=True)
+    job_status = wait_for_ray_job(
+        kubectl,
+        namespace=namespace,
+        head_pod=current_head,
+        remote_dir=str(record["remoteDir"]),
+        submission_id=expected_run_id,
+        poll_seconds=poll_seconds,
+    )
+    finalize_submitted_job(
+        kubectl,
+        namespace=namespace,
+        cluster=cluster,
+        run_id=expected_run_id,
+        head_pod=current_head,
+        remote_dir=str(record["remoteDir"]),
+        remote_result=str(record["remoteResult"]),
+        result_path=result_path,
+        job_status=job_status,
+        failure_retention_seconds=failure_retention_seconds,
+        keep_success_resources=keep_success_resources,
+    )
+
+
 def submit(
     *,
     injection_dir: Path,
@@ -356,10 +817,17 @@ def submit(
     result_path: Path,
     timeout_seconds: int,
     failure_retention_seconds: int,
+    poll_seconds: float,
     keep_success_resources: bool,
 ) -> None:
+    submission_record_path = result_path.with_name(SUBMISSION_RECORD_FILENAME)
     if result_path.exists() or result_path.is_symlink():
         raise SubmitError(f"refusing to overwrite result: {result_path}")
+    if submission_record_path.exists() or submission_record_path.is_symlink():
+        raise SubmitError(
+            "existing Ray Job submission record requires explicit resume: "
+            f"{submission_record_path}"
+        )
     kubectl = kubectl_prefix(kubectl_command, kubeconfig)
     run_id = str(injection["runId"])
     try:
@@ -381,97 +849,93 @@ def submit(
         raise
 
     remote_result = f"{remote_dir}/execution-result.json"
-    driver_command = [
-        *kubectl,
-        "exec",
-        "-n",
-        namespace,
-        head_pod,
-        "-c",
-        "ray-head",
-        "--",
-        "/home/ray/anaconda3/bin/python",
-        f"{remote_dir}/{DRIVER_PATH.name}",
-        "--injection",
-        f"{remote_dir}/injection.json",
-        "--scripts-dir",
-        remote_dir,
-        "--result",
-        remote_result,
-        "--timeout-seconds",
-        str(timeout_seconds),
-    ]
-    driver_result: subprocess.CompletedProcess[str] | None = None
-    driver_error: SubmitError | None = None
+    driver_entrypoint = shlex.join(
+        [
+            REMOTE_PYTHON,
+            f"{remote_dir}/{DRIVER_PATH.name}",
+            "--injection",
+            f"{remote_dir}/injection.json",
+            "--scripts-dir",
+            remote_dir,
+            "--result",
+            remote_result,
+            "--timeout-seconds",
+            str(timeout_seconds),
+        ]
+    )
+    submission_id = run_id
+    metadata = json.dumps(
+        {
+            "kccRunId": run_id,
+            "kccNamespace": namespace,
+            "kccRayCluster": cluster,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     try:
-        driver_result = run_command(
-            driver_command,
-            timeout=None,
-            check=False,
-        )
-    except SubmitError as error:
-        driver_error = error
-
-    export_error: SubmitError | None = None
-    try:
-        export_result(
+        submitted = call_job_api(
             kubectl,
             namespace=namespace,
             head_pod=head_pod,
-            remote_result=remote_result,
-            local_result=result_path,
+            remote_dir=remote_dir,
+            operation="submit",
+            submission_id=submission_id,
+            extra_arguments=(
+                "--entrypoint",
+                driver_entrypoint,
+                "--metadata-json",
+                metadata,
+            ),
+        )
+        if submitted.get("submissionId") != submission_id:
+            raise SubmitError("Ray Jobs API changed the requested submission ID")
+        write_json_create_only(
+            submission_record_path,
+            {
+                "schemaVersion": SUBMISSION_RECORD_SCHEMA,
+                "runId": run_id,
+                "submissionId": submission_id,
+                "namespace": namespace,
+                "cluster": cluster,
+                "headPod": head_pod,
+                "remoteDir": remote_dir,
+                "remoteHelper": f"{remote_dir}/{REMOTE_HELPER_PATH.name}",
+                "remoteResult": remote_result,
+                "submittedAt": utc_now(),
+            },
+            label="Ray Job submission record",
+        )
+        print(f"RAY JOB: submitted {submission_id}", flush=True)
+        job_status = wait_for_ray_job(
+            kubectl,
+            namespace=namespace,
+            head_pod=head_pod,
+            remote_dir=remote_dir,
+            submission_id=submission_id,
+            poll_seconds=poll_seconds,
         )
     except SubmitError as error:
-        export_error = error
+        print(
+            "FAILED RESOURCE RETENTION: Ray Job state is uncertain; "
+            "RayCluster is retained indefinitely.",
+            file=sys.stderr,
+        )
+        raise SubmitError(f"Ray Job submission or status failed: {error}") from error
 
-    if driver_error is not None:
-        suffix = f"; result export also failed: {export_error}" if export_error else ""
-        print(
-            "FAILED RESOURCE RETENTION: training state is uncertain; "
-            "RayCluster is retained indefinitely.",
-            file=sys.stderr,
-        )
-        raise SubmitError(f"training driver did not complete: {driver_error}{suffix}")
-    if driver_result is None:
-        raise SubmitError("training driver did not return")
-    if driver_result.returncode != 0:
-        suffix = (
-            f"; failure result exported to {result_path}"
-            if export_error is None
-            else f"; result export failed: {export_error}"
-        )
-        if export_error is None:
-            retain_then_delete_failed_cluster(
-                kubectl,
-                namespace=namespace,
-                cluster=cluster,
-                retention_seconds=failure_retention_seconds,
-            )
-        else:
-            print(
-                "FAILED RESOURCE RETENTION: result export failed; "
-                "RayCluster is retained indefinitely.",
-                file=sys.stderr,
-            )
-        raise SubmitError(
-            f"training driver failed with exit code {driver_result.returncode}{suffix}"
-        )
-    if export_error is not None:
-        print(
-            "FAILED RESOURCE RETENTION: successful result could not be exported; "
-            "RayCluster is retained indefinitely.",
-            file=sys.stderr,
-        )
-        raise export_error
-    if keep_success_resources:
-        print("SUCCESS RESOURCE RETENTION: RayCluster was left in place.")
-    else:
-        print(
-            "SUCCESS RESOURCE CLEANUP: deleting the RayCluster; "
-            "all checkpoints and training logs are retained."
-        )
-        delete_ray_cluster(kubectl, namespace=namespace, cluster=cluster)
-    print(f"PASS: training result exported to {result_path}")
+    finalize_submitted_job(
+        kubectl,
+        namespace=namespace,
+        cluster=cluster,
+        run_id=run_id,
+        head_pod=head_pod,
+        remote_dir=remote_dir,
+        remote_result=remote_result,
+        result_path=result_path,
+        job_status=job_status,
+        failure_retention_seconds=failure_retention_seconds,
+        keep_success_resources=keep_success_resources,
+    )
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -479,22 +943,30 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--injection-dir", type=Path, required=True)
     parser.add_argument(
         "--kubectl-command",
-        default="/usr/local/bin/k3s kubectl",
     )
-    parser.add_argument("--kubeconfig", type=Path, default=DEFAULT_KUBECONFIG)
-    parser.add_argument("--namespace", default="pretrain-ray")
-    parser.add_argument("--cluster", default="pretrain-gpu00-gpu01")
+    parser.add_argument("--kubeconfig", type=Path)
+    parser.add_argument("--namespace")
+    parser.add_argument("--cluster")
     parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument(
+        "--resume-existing",
+        action="store_true",
+        help="reattach to the recorded Ray Job without submitting a new one",
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=DEFAULT_POLL_SECONDS,
+        help="Ray Job status poll interval",
+    )
     parser.add_argument(
         "--timeout-seconds",
         type=int,
-        default=0,
         help="per-worker training timeout; 0 means no timeout",
     )
     parser.add_argument(
         "--failure-retention-seconds",
         type=int,
-        default=1800,
         help="failed training retention; -1 keeps the RayCluster indefinitely",
     )
     parser.add_argument(
@@ -508,26 +980,59 @@ def make_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
     try:
-        if args.timeout_seconds < 0 or args.failure_retention_seconds < -1:
+        defaults = cluster_config.apply_kubernetes_defaults(args)
+        if args.timeout_seconds is None or args.failure_retention_seconds is None:
+            defaults = defaults or cluster_config.load_cluster_config()
+        if args.timeout_seconds is None:
+            args.timeout_seconds = defaults.timeouts.training_seconds
+        if args.failure_retention_seconds is None:
+            args.failure_retention_seconds = (
+                defaults.timeouts.failed_resource_retention_seconds
+            )
+        if (
+            args.timeout_seconds < 0
+            or args.failure_retention_seconds < -1
+            or args.poll_seconds <= 0
+        ):
             raise SubmitError(
-                "timeout must be zero or positive and retention must be -1 or non-negative"
+                "timeout must be non-negative, retention at least -1, "
+                "and poll interval positive"
             )
         injection_dir = args.injection_dir.resolve()
         injection, scripts = load_injection(injection_dir)
-        submit(
-            injection_dir=injection_dir,
-            injection=injection,
-            scripts=scripts,
-            kubectl_command=args.kubectl_command,
-            kubeconfig=args.kubeconfig.resolve(),
-            namespace=args.namespace,
-            cluster=args.cluster,
-            result_path=args.result.resolve(),
-            timeout_seconds=args.timeout_seconds,
-            failure_retention_seconds=args.failure_retention_seconds,
-            keep_success_resources=args.keep_success_resources,
-        )
-    except (SubmitError, OSError, UnicodeError) as error:
+        if args.resume_existing:
+            resume_existing_submission(
+                expected_run_id=str(injection["runId"]),
+                kubectl_command=args.kubectl_command,
+                kubeconfig=args.kubeconfig.resolve(),
+                namespace=args.namespace,
+                cluster=args.cluster,
+                result_path=args.result.resolve(),
+                failure_retention_seconds=args.failure_retention_seconds,
+                poll_seconds=args.poll_seconds,
+                keep_success_resources=args.keep_success_resources,
+            )
+        else:
+            submit(
+                injection_dir=injection_dir,
+                injection=injection,
+                scripts=scripts,
+                kubectl_command=args.kubectl_command,
+                kubeconfig=args.kubeconfig.resolve(),
+                namespace=args.namespace,
+                cluster=args.cluster,
+                result_path=args.result.resolve(),
+                timeout_seconds=args.timeout_seconds,
+                failure_retention_seconds=args.failure_retention_seconds,
+                poll_seconds=args.poll_seconds,
+                keep_success_resources=args.keep_success_resources,
+            )
+    except (
+        SubmitError,
+        OSError,
+        UnicodeError,
+        cluster_config.ClusterConfigError,
+    ) as error:
         print(f"STOP: Ray training submission failed: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
