@@ -44,6 +44,24 @@ LOCAL_PATH_DESTINATIONS = frozenset(
         "recovery_state_root",
     }
 )
+LEGACY_RECOVERY_ARGUMENT_DESTINATIONS = frozenset(
+    {
+        "no_progress_seconds",
+        "same_topology_retries",
+        "retry_backoff_seconds",
+        "diagnosis_window_seconds",
+        "diagnosis_poll_seconds",
+        "diagnosis_stable_samples",
+    }
+)
+LEGACY_HARDWARE_ARGUMENT_DESTINATIONS = frozenset(
+    {
+        "devices_per_node",
+        "runtime_class_name",
+        "head_selector",
+        "worker_selector",
+    }
+)
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -171,6 +189,11 @@ def parse_start_arguments(argv: Sequence[str]) -> tuple[argparse.ArgumentParser,
             )
         if args.cleanup_timeout_seconds <= 0:
             raise ValueError("cleanup timeout must be positive")
+        recovery_policy = recovery_supervisor.recovery_policy_from_args(args)
+        recovery_supervisor.maximum_attempt_count(
+            max_recoveries,
+            recovery_policy["sameTopologyRetries"],
+        )
         first_attempt = recovery_supervisor.attempt_run_id(args.run_id, 0)
         start_ray.validate_args(args, first_attempt)
     except (ValueError, recovery_supervisor.RecoveryError) as error:
@@ -206,16 +229,22 @@ def _action_option(action: argparse.Action) -> str:
 def build_supervisor_arguments(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
+    *,
+    omit_destinations: frozenset[str] = frozenset(),
+    boolean_overrides: Mapping[str, bool] | None = None,
 ) -> list[str]:
     """Build deterministic in-Pod argv without inheriting local auth settings."""
     result: list[str] = []
+    overrides = boolean_overrides or {}
     for action in parser._actions:
         destination = action.dest
-        if destination in {"help", "resume"}:
+        if destination in {"help", "resume"} or destination in omit_destinations:
             continue
         option = _action_option(action)
-        if destination == "kubectl_command":
-            value: Any = INTERNAL_KUBECTL_COMMAND
+        if destination in overrides:
+            value: Any = overrides[destination]
+        elif destination == "kubectl_command":
+            value = INTERNAL_KUBECTL_COMMAND
         elif destination == "kubeconfig":
             value = INTERNAL_KUBECONFIG
         else:
@@ -235,6 +264,31 @@ def build_supervisor_arguments(
     if result.count("--resume") != 1:
         raise SupervisorJobError("internal resume argument construction failed")
     return result
+
+
+def compatible_resume_argument_digests(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> frozenset[str]:
+    """Exact argv hashes for current and legacy launcher formats."""
+    digests: set[str] = set()
+    for omit_recovery in (False, True):
+        for omit_hardware in (False, True):
+            omitted = frozenset().union(
+                LEGACY_RECOVERY_ARGUMENT_DESTINATIONS if omit_recovery else (),
+                LEGACY_HARDWARE_ARGUMENT_DESTINATIONS if omit_hardware else (),
+            )
+            for legacy_confirm in (False, True):
+                arguments = build_supervisor_arguments(
+                    parser,
+                    args,
+                    omit_destinations=omitted,
+                    boolean_overrides={
+                        "confirm_checkpoint_exclusive": legacy_confirm,
+                    },
+                )
+                digests.add(arguments_sha256(arguments))
+    return frozenset(digests)
 
 
 def build_job_manifest(
@@ -323,6 +377,10 @@ def build_job_manifest(
                                 {"name": "PYTHONPATH", "value": str(BUNDLE_DIR)},
                                 {"name": "PYTHONUNBUFFERED", "value": "1"},
                                 {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
+                                {
+                                    "name": "KCC_RAY_SUPERVISOR_JOB_NAME",
+                                    "value": name,
+                                },
                             ],
                             "volumeMounts": [
                                 {
@@ -462,6 +520,27 @@ def validate_owned_job(
         raise SupervisorJobError("an active supervisor Job belongs to another run ID")
     if args_sha256 is not None and recorded_digest != args_sha256:
         raise SupervisorJobError("supervisor Job arguments differ from this request")
+
+
+def validate_resume_job_arguments(
+    job: Mapping[str, Any],
+    *,
+    namespace: str,
+    cluster: str,
+    run_id: str,
+    accepted_digests: frozenset[str],
+) -> None:
+    validate_owned_job(
+        job,
+        namespace=namespace,
+        cluster=cluster,
+        run_id=run_id,
+    )
+    annotations = job["metadata"]["annotations"]
+    if annotations[ARGS_SHA256_ANNOTATION] not in accepted_digests:
+        raise SupervisorJobError(
+            "supervisor Job arguments differ from this request"
+        )
 
 
 def _job_phase(job: Mapping[str, Any]) -> str:
@@ -654,6 +733,9 @@ def _validate_orphan_raycluster_resume(
             raise recovery_supervisor.RecoveryError(
                 "max recoveries differ from the resumable topology"
             )
+        recovery_policy = recovery_supervisor.apply_frozen_recovery_policy(
+            args, state
+        )
         _, _, _, _, attempt, resume_current_attempt = (
             recovery_supervisor.validate_resumable_state(
                 state,
@@ -661,6 +743,9 @@ def _validate_orphan_raycluster_resume(
                 initial_active_nodes=initial_active_nodes,
                 initial_spare_nodes=initial_spare_nodes,
                 max_replacements=max_replacements,
+                same_topology_retries=recovery_policy[
+                    "sameTopologyRetries"
+                ],
                 training_artifact_root=args.training_artifact_root,
             )
         )
@@ -746,6 +831,11 @@ def start(argv: Sequence[str]) -> dict[str, Any]:
     parser, args = parse_start_arguments(argv)
     supervisor_arguments = build_supervisor_arguments(parser, args)
     digest = arguments_sha256(supervisor_arguments)
+    resume_digests = (
+        compatible_resume_argument_digests(parser, args)
+        if args.resume
+        else frozenset()
+    )
     manifest = build_job_manifest(
         args=args,
         supervisor_arguments=supervisor_arguments,
@@ -776,12 +866,12 @@ def start(argv: Sequence[str]) -> dict[str, Any]:
                 raise SupervisorJobError(
                     "a supervisor Job is already active; use --resume to reattach"
                 )
-            validate_owned_job(
+            validate_resume_job_arguments(
                 existing,
                 namespace=args.namespace,
                 cluster=args.cluster,
                 run_id=args.run_id,
-                args_sha256=digest,
+                accepted_digests=resume_digests,
             )
             return _job_summary(existing, reused=True)
 
@@ -790,12 +880,12 @@ def start(argv: Sequence[str]) -> dict[str, Any]:
                 raise SupervisorJobError(
                     "the terminal supervisor Job belongs to this run; use --resume"
                 )
-            validate_owned_job(
+            validate_resume_job_arguments(
                 existing,
                 namespace=args.namespace,
                 cluster=args.cluster,
                 run_id=args.run_id,
-                args_sha256=digest,
+                accepted_digests=resume_digests,
             )
         elif _raycluster_exists(
             kubectl=kubectl, namespace=args.namespace, cluster=args.cluster

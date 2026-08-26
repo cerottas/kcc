@@ -24,7 +24,7 @@ from typing import Any, Mapping, Sequence
 SCHEMA_VERSION = "1.0"
 DEFAULT_HCCN_TOOL = "/usr/local/Ascend/driver/tools/hccn_tool"
 DEFAULT_RANK_TABLE = "/user/serverid/devindex/config/hccl.json"
-DEFAULT_PROBE_BINARY = "/opt/hccl-check/bin/ranktable_allreduce_probe"
+DEFAULT_PROBE_BINARY = "/opt/kcc-hccl/bin/ranktable_allreduce_probe"
 DEFAULT_LOG_ROOT = "/var/log/hccl-check"
 MAX_DIAGNOSTIC_TEXT = 64 * 1024
 MAX_STAGE_OUTPUT_BYTES = 32 * 1024 * 1024

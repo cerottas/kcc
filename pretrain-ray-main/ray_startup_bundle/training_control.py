@@ -17,6 +17,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 import cluster_config
+import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -224,7 +225,7 @@ def owned_state_dir(args: argparse.Namespace, attempt: str) -> Path | None:
     if RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise ControlError("run ID contains unsupported characters")
     if args.run_id == attempt:  # Single-pipeline --fresh/--all-nodes run.
-        return None
+        return args.training_artifact_root.resolve() / attempt
     state_dir = args.recovery_state_root.resolve() / args.run_id
     state = read_json(
         state_dir / "state.json",
@@ -242,11 +243,58 @@ def owned_state_dir(args: argparse.Namespace, attempt: str) -> Path | None:
     return state_dir
 
 
+def fresh_artifact_dir(args: argparse.Namespace) -> Path | None:
+    """Return an owned single-pipeline artifact directory when it is observable."""
+
+    artifact_dir = args.training_artifact_root.resolve() / args.run_id
+    manifest_path = artifact_dir / "raycluster.yaml"
+    if not artifact_dir.is_dir() or artifact_dir.is_symlink():
+        return None
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        return None
+    try:
+        if manifest_path.stat().st_size > RECOVERY_STATE_MAX_BYTES:
+            raise ControlError(
+                f"rendered RayCluster manifest is unexpectedly large: {manifest_path}"
+            )
+        documents = tuple(
+            yaml.safe_load_all(manifest_path.read_text(encoding="utf-8"))
+        )
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise ControlError(
+            f"cannot read rendered RayCluster manifest {manifest_path}: {error}"
+        ) from error
+    for document in documents:
+        if not isinstance(document, Mapping) or document.get("kind") != "RayCluster":
+            continue
+        metadata = document.get("metadata")
+        annotations = (
+            metadata.get("annotations") if isinstance(metadata, Mapping) else None
+        )
+        if (
+            isinstance(metadata, Mapping)
+            and metadata.get("name") == args.cluster
+            and metadata.get("namespace") == args.namespace
+            and isinstance(annotations, Mapping)
+            and annotations.get("trainctl.io/run-id") == args.run_id
+        ):
+            return artifact_dir
+    raise ControlError("rendered RayCluster manifest ownership is invalid")
+
+
 def request_stop_without_cluster(args: argparse.Namespace) -> int:
-    """Durably stop a recovery Job before its RayCluster is observable."""
+    """Durably stop a run before its RayCluster is observable."""
 
     if RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise ControlError("run ID contains unsupported characters")
+    artifact_dir = fresh_artifact_dir(args)
+    if artifact_dir is not None:
+        mark_stop(args, artifact_dir, None, args.run_id, "IMMEDIATE", None)
+        print(
+            "PASS: stop request accepted before fresh Ray startup; "
+            "checkpoints were untouched."
+        )
+        return 0
     state_dir = args.recovery_state_root.resolve() / args.run_id
     state = read_json(
         state_dir / "state.json",
@@ -542,6 +590,11 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--namespace")
     parser.add_argument("--cluster")
     parser.add_argument("--recovery-state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument(
+        "--training-artifact-root",
+        type=Path,
+        default=DEFAULT_ARTIFACT_ROOT,
+    )
     parser.add_argument("--cleanup-timeout-seconds", type=int)
 
 
@@ -555,11 +608,6 @@ def make_parser() -> argparse.ArgumentParser:
         help="wait for the next committed checkpoint, then stop",
     )
     add_common(after)
-    after.add_argument(
-        "--training-artifact-root",
-        type=Path,
-        default=DEFAULT_ARTIFACT_ROOT,
-    )
     after.add_argument("--poll-seconds", type=float, default=5.0)
     after.add_argument("--timeout-seconds", type=int, default=0)
     return parser

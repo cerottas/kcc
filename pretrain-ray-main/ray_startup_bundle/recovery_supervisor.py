@@ -38,6 +38,26 @@ TRAINING_TEMPLATE_SNAPSHOT_SCHEMA = "training-template-snapshot/v1"
 TRAINING_TEMPLATE_SNAPSHOT_FILENAME = "training-template.sh"
 TRAINING_TEMPLATE_METADATA_FILENAME = "training-template.json"
 TRAINING_TEMPLATE_MAX_BYTES = 1024 * 1024
+SUPERVISOR_JOB_NAME_ENV = "KCC_RAY_SUPERVISOR_JOB_NAME"
+MAX_RECOVERY_ATTEMPTS = 32
+RECOVERY_POLICY_FIELDS = {
+    "sameTopologyRetries": "same_topology_retries",
+    "retryBackoffSeconds": "retry_backoff_seconds",
+    "noProgressSeconds": "no_progress_seconds",
+    "diagnosisWindowSeconds": "diagnosis_window_seconds",
+    "diagnosisPollSeconds": "diagnosis_poll_seconds",
+    "diagnosisStableSamples": "diagnosis_stable_samples",
+}
+NON_NODE_FAILURE_CLASSES = frozenset(
+    {
+        "CHECKPOINT_UNAVAILABLE",
+        "DRIVER_INTERNAL_FAILURE",
+        "DRIVER_PROTOCOL_FAILURE",
+        "INTERRUPTED",
+        "TIMEOUT",
+        "TRAINING_NO_PROGRESS",
+    }
+)
 
 
 def accepted_stop_request(
@@ -55,6 +75,18 @@ def accepted_stop_request(
 
 
 class RecoveryError(RuntimeError):
+    pass
+
+
+class RecoveryOwnershipError(RecoveryError):
+    """A live Kubernetes object is proven to belong to another run."""
+
+    pass
+
+
+class RecoveryStopRequested(RuntimeError):
+    """Interrupt a bounded wait after a durable user stop request appears."""
+
     pass
 
 
@@ -163,6 +195,27 @@ def write_state(path: Path, payload: Mapping[str, Any]) -> None:
         raise RecoveryError(f"cannot persist recovery state: {error}") from error
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def record_stopped_state(
+    *,
+    state_path: Path,
+    state: dict[str, Any],
+    stop_request: Mapping[str, Any],
+    attempt_state: dict[str, Any] | None = None,
+    cleanup_failure: str | None = None,
+) -> None:
+    if attempt_state is not None:
+        attempt_state["status"] = "STOPPED"
+        attempt_state["stopRequest"] = dict(stop_request)
+        if cleanup_failure is not None:
+            attempt_state["cleanupFailure"] = cleanup_failure
+    state["status"] = "STOPPED"
+    state["stopRequest"] = dict(stop_request)
+    if cleanup_failure is not None:
+        state["cleanupFailure"] = cleanup_failure
+    state["updatedAt"] = utc_now()
+    write_state(state_path, state)
 
 
 def read_bounded_regular_bytes(
@@ -511,6 +564,49 @@ def kubectl_prefix(command_text: str, kubeconfig: Path | None) -> list[str]:
     return command
 
 
+def emit_manual_required_alert(
+    args: argparse.Namespace,
+    *,
+    job_id: str,
+    reason: str,
+) -> None:
+    """Emit one best-effort cluster-native warning after durable state is saved."""
+    detail = " ".join(reason.split())[:500] or "manual recovery is required"
+    print(f"ALERT: recovery job {job_id} requires manual action: {detail}", file=sys.stderr)
+    supervisor_job = os.environ.get(SUPERVISOR_JOB_NAME_ENV)
+    if not supervisor_job:
+        return
+    digest = hashlib.sha256(f"{job_id}\0{detail}".encode("utf-8")).hexdigest()[:12]
+    event_name = f"kcc-ray-manual-{digest}"
+    try:
+        result = subprocess.run(
+            [
+                *kubectl_prefix(args.kubectl_command, args.kubeconfig.resolve()),
+                "create",
+                "event",
+                event_name,
+                "-n",
+                args.namespace,
+                f"--for=job/{supervisor_job}",
+                "--type=Warning",
+                "--reason=RecoveryManualRequired",
+                f"--note=run {job_id}: {detail}",
+            ],
+            check=False,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0 and "already exists" not in (
+            result.stderr + result.stdout
+        ).lower():
+            message = (result.stderr.strip() or result.stdout.strip())[:300]
+            print(f"ALERT: Kubernetes Warning Event could not be created: {message}", file=sys.stderr)
+    except (OSError, RecoveryError, subprocess.TimeoutExpired) as error:
+        print(f"ALERT: Kubernetes Warning Event could not be created: {error}", file=sys.stderr)
+
+
 def run_cleanup_query(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -580,6 +676,55 @@ def query_cluster_cleanup(
         line.strip() for line in configmaps.stdout.splitlines() if line.strip()
     )
     return remaining, configmap_names
+
+
+def query_owned_raycluster(
+    *,
+    kubectl: Sequence[str],
+    namespace: str,
+    cluster: str,
+    run_id: str,
+) -> Mapping[str, Any] | None:
+    """Return the current owned RayCluster, or None when it is gone."""
+    result = run_cleanup_query(
+        [
+            *kubectl,
+            "get",
+            "raycluster",
+            cluster,
+            "-n",
+            namespace,
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ]
+    )
+    if not result.stdout.strip():
+        return None
+    try:
+        document = json.loads(result.stdout)
+        metadata = document.get("metadata", {})
+        annotations = metadata.get("annotations", {})
+    except (AttributeError, json.JSONDecodeError) as error:
+        raise RecoveryError(
+            f"cannot parse RayCluster ownership: {error}"
+        ) from error
+    if (
+        not isinstance(document, Mapping)
+        or document.get("kind") != "RayCluster"
+        or not isinstance(metadata, Mapping)
+        or metadata.get("name") != cluster
+        or metadata.get("namespace") != namespace
+    ):
+        raise RecoveryError("RayCluster ownership response is invalid")
+    if not isinstance(annotations, Mapping):
+        raise RecoveryError("RayCluster annotations are not an object")
+    if annotations.get("trainctl.io/run-id") != run_id:
+        raise RecoveryOwnershipError(
+            "refusing to use a RayCluster whose run-id annotation does not "
+            "match the current attempt"
+        )
+    return document
 
 
 def get_cleanup_configmap(
@@ -743,61 +888,86 @@ def wait_for_cluster_cleanup(
     poll_seconds: float = 2.0,
 ) -> None:
     kubectl = kubectl_prefix(kubectl_command, kubeconfig)
+    deadline = time.monotonic() + timeout_seconds
+    delete_requested = False
+    last_query_error: str | None = None
     # The Ray Jobs training submitter normally requests this deletion first. If
     # the object still exists, verify the run-id annotation written by the
     # existing renderer before repeating that same idempotent delete.  A
     # different annotation means another launcher owns the cluster name.
-    current_cluster = run_cleanup_query(
-        [
-            *kubectl,
-            "get",
-            "raycluster",
-            cluster,
-            "-n",
-            namespace,
-            "--ignore-not-found",
-            "-o",
-            "json",
-        ]
-    )
-    if current_cluster.stdout.strip():
-        try:
-            cluster_document = json.loads(current_cluster.stdout)
-            annotations = cluster_document.get("metadata", {}).get(
-                "annotations", {}
-            )
-        except (AttributeError, json.JSONDecodeError) as error:
-            raise RecoveryError(
-                f"cannot parse failed RayCluster ownership: {error}"
-            ) from error
-        if not isinstance(annotations, Mapping):
-            raise RecoveryError("failed RayCluster annotations are not an object")
-        if annotations.get("trainctl.io/run-id") != run_id:
-            raise RecoveryError(
-                "refusing to delete a RayCluster whose run-id annotation "
-                "does not match the failed attempt"
-            )
-        # Deleting the RayCluster lets Kubernetes stop only that cluster's
-        # Pods; this intentionally does not scan or kill arbitrary host PIDs.
-        run_cleanup_query(
-            [
-                *kubectl,
-                "delete",
-                "raycluster",
-                cluster,
-                "-n",
-                namespace,
-                "--ignore-not-found=true",
-                "--wait=false",
-            ]
-        )
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        workload_remaining, configmaps = query_cluster_cleanup(
+    try:
+        current_cluster = query_owned_raycluster(
             kubectl=kubectl,
             namespace=namespace,
             cluster=cluster,
+            run_id=run_id,
         )
+        if current_cluster is not None:
+            run_cleanup_query(
+                [
+                    *kubectl,
+                    "delete",
+                    "raycluster",
+                    cluster,
+                    "-n",
+                    namespace,
+                    "--ignore-not-found=true",
+                    "--wait=false",
+                ]
+            )
+        delete_requested = True
+    except RecoveryOwnershipError:
+        raise
+    except RecoveryError as error:
+        last_query_error = str(error)
+        print(
+            "WARNING: cleanup ownership query failed; retrying within the "
+            f"{timeout_seconds}s cleanup deadline: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+    while time.monotonic() < deadline:
+        try:
+            if not delete_requested:
+                current_cluster = query_owned_raycluster(
+                    kubectl=kubectl,
+                    namespace=namespace,
+                    cluster=cluster,
+                    run_id=run_id,
+                )
+                if current_cluster is not None:
+                    # Deleting the RayCluster lets Kubernetes stop only that
+                    # cluster's Pods; this never scans arbitrary host PIDs.
+                    run_cleanup_query(
+                        [
+                            *kubectl,
+                            "delete",
+                            "raycluster",
+                            cluster,
+                            "-n",
+                            namespace,
+                            "--ignore-not-found=true",
+                            "--wait=false",
+                        ]
+                    )
+                delete_requested = True
+            workload_remaining, configmaps = query_cluster_cleanup(
+                kubectl=kubectl,
+                namespace=namespace,
+                cluster=cluster,
+            )
+        except RecoveryOwnershipError:
+            raise
+        except RecoveryError as error:
+            last_query_error = str(error)
+            print(
+                "WARNING: cleanup status query failed; retrying within the "
+                f"{timeout_seconds}s cleanup deadline: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(poll_seconds)
+            continue
         remaining = [*workload_remaining]
         if configmaps:
             remaining.append("RankTable ConfigMap(s)")
@@ -805,11 +975,18 @@ def wait_for_cluster_cleanup(
             return
         time.sleep(poll_seconds)
 
-    workload_remaining, configmaps = query_cluster_cleanup(
-        kubectl=kubectl,
-        namespace=namespace,
-        cluster=cluster,
-    )
+    try:
+        workload_remaining, configmaps = query_cluster_cleanup(
+            kubectl=kubectl,
+            namespace=namespace,
+            cluster=cluster,
+        )
+    except RecoveryError as error:
+        detail = str(error) or last_query_error or "unknown query error"
+        raise RecoveryError(
+            f"timed out after {timeout_seconds}s while querying failed cluster "
+            f"cleanup: {detail}"
+        ) from error
     if workload_remaining:
         raise RecoveryError(
             f"timed out after {timeout_seconds}s waiting for failed cluster cleanup: "
@@ -897,6 +1074,31 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--same-topology-retries",
+        type=int,
+        help="same-node retry limit; defaults to config/cluster.yaml",
+    )
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=int,
+        help="delay before a same-node retry; defaults to config/cluster.yaml",
+    )
+    parser.add_argument(
+        "--diagnosis-window-seconds",
+        type=int,
+        help="bounded diagnosis sampling window; defaults to config/cluster.yaml",
+    )
+    parser.add_argument(
+        "--diagnosis-poll-seconds",
+        type=int,
+        help="diagnosis sampling interval; defaults to config/cluster.yaml",
+    )
+    parser.add_argument(
+        "--diagnosis-stable-samples",
+        type=int,
+        help="matching samples required for replacement; defaults to config/cluster.yaml",
+    )
+    parser.add_argument(
         "--recovery-state-root",
         type=Path,
         default=DEFAULT_STATE_ROOT,
@@ -921,6 +1123,16 @@ def apply_config_defaults(
     needs_recovery_config = (
         getattr(args, "spare_node", None) is None
         or getattr(args, "cleanup_timeout_seconds", None) is None
+        or any(
+            hasattr(args, destination) and getattr(args, destination) is None
+            for destination in (
+                "same_topology_retries",
+                "retry_backoff_seconds",
+                "diagnosis_window_seconds",
+                "diagnosis_poll_seconds",
+                "diagnosis_stable_samples",
+            )
+        )
     )
     defaults = config
     if defaults is None and needs_recovery_config:
@@ -933,6 +1145,15 @@ def apply_config_defaults(
         args.spare_node = list(defaults.spare_nodes)
     if getattr(args, "cleanup_timeout_seconds", None) is None:
         args.cleanup_timeout_seconds = defaults.timeouts.recovery_cleanup_seconds
+    for destination in (
+        "same_topology_retries",
+        "retry_backoff_seconds",
+        "diagnosis_window_seconds",
+        "diagnosis_poll_seconds",
+        "diagnosis_stable_samples",
+    ):
+        if hasattr(args, destination) and getattr(args, destination) is None:
+            setattr(args, destination, getattr(defaults.recovery, destination))
     return defaults
 
 
@@ -974,6 +1195,124 @@ def _state_nonnegative_int(value: object, *, label: str) -> int:
     return value
 
 
+def recovery_policy_from_args(args: argparse.Namespace) -> dict[str, int]:
+    argument_names = tuple(RECOVERY_POLICY_FIELDS.values())
+    present = tuple(hasattr(args, name) for name in argument_names)
+    if not any(present):
+        return legacy_recovery_policy()
+    if not all(present):
+        raise RecoveryError("recovery policy arguments are incomplete")
+    policy: dict[str, int] = {}
+    for state_name, argument_name in RECOVERY_POLICY_FIELDS.items():
+        value = getattr(args, argument_name, None)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RecoveryError(f"recovery policy {state_name} is invalid")
+        policy[state_name] = value
+    validate_recovery_policy(policy)
+    return policy
+
+
+def validate_recovery_policy(policy: Mapping[str, Any]) -> None:
+    if set(policy) != set(RECOVERY_POLICY_FIELDS):
+        raise RecoveryError("recovery policy fields are invalid")
+    values = {
+        key: _state_nonnegative_int(policy.get(key), label=f"policy {key}")
+        for key in RECOVERY_POLICY_FIELDS
+    }
+    if values["diagnosisPollSeconds"] <= 0:
+        raise RecoveryError("diagnosis poll interval must be positive")
+    if values["diagnosisStableSamples"] <= 0:
+        raise RecoveryError("diagnosis stable sample count must be positive")
+    if values["sameTopologyRetries"] > 10:
+        raise RecoveryError("same-topology retries must not exceed 10")
+    if values["retryBackoffSeconds"] > 24 * 60 * 60:
+        raise RecoveryError("retry backoff must not exceed one day")
+    max_samples = diagnosis_sample_limit(
+        values["diagnosisWindowSeconds"], values["diagnosisPollSeconds"]
+    )
+    if values["diagnosisStableSamples"] > max_samples:
+        raise RecoveryError(
+            "diagnosis stable sample count exceeds the configured sampling window"
+        )
+
+
+def legacy_recovery_policy() -> dict[str, int]:
+    """Preserve the one-shot/no-watchdog behavior of pre-policy state files."""
+    return {
+        "sameTopologyRetries": 0,
+        "retryBackoffSeconds": 0,
+        "noProgressSeconds": 0,
+        "diagnosisWindowSeconds": 0,
+        "diagnosisPollSeconds": 1,
+        "diagnosisStableSamples": 1,
+    }
+
+
+def apply_frozen_recovery_policy(
+    args: argparse.Namespace,
+    state: Mapping[str, Any] | None,
+) -> dict[str, int]:
+    raw_policy: Mapping[str, Any]
+    if state is None:
+        raw_policy = recovery_policy_from_args(args)
+    else:
+        stored = state.get("recoveryPolicy")
+        raw_policy = legacy_recovery_policy() if stored is None else stored
+        if not isinstance(raw_policy, Mapping):
+            raise RecoveryError("recovery state policy is invalid")
+        validate_recovery_policy(raw_policy)
+    policy = {key: int(raw_policy[key]) for key in RECOVERY_POLICY_FIELDS}
+    for state_name, argument_name in RECOVERY_POLICY_FIELDS.items():
+        setattr(args, argument_name, policy[state_name])
+    return policy
+
+
+def diagnosis_sample_limit(window_seconds: int, poll_seconds: int) -> int:
+    if window_seconds <= 0:
+        return 1
+    return 1 + window_seconds // poll_seconds
+
+
+def maximum_attempt_count(max_replacements: int, same_topology_retries: int) -> int:
+    count = (max_replacements + 1) * (same_topology_retries + 1)
+    if count > MAX_RECOVERY_ATTEMPTS:
+        raise RecoveryError(
+            f"recovery policy permits {count} attempts; limit is {MAX_RECOVERY_ATTEMPTS}"
+        )
+    return count
+
+
+def same_topology_retries_used(attempts: Sequence[Mapping[str, Any]]) -> int:
+    used = 0
+    for attempt in reversed(attempts):
+        if attempt.get("status") == "REPLACED":
+            break
+        if (
+            attempt.get("status") == "RETRY_SAME_TOPOLOGY"
+            and attempt.get("recoveryAction") == "same-topology"
+        ):
+            used += 1
+    return used
+
+
+def diagnosed_failed_nodes(diagnosis: object) -> tuple[str, ...]:
+    if not isinstance(diagnosis, Mapping):
+        return ()
+    raw = diagnosis.get("failedActiveNodes")
+    if not isinstance(raw, list):
+        replacements = diagnosis.get("replacements")
+        raw = (
+            [
+                item.get("failedNode")
+                for item in replacements
+                if isinstance(item, Mapping)
+            ]
+            if isinstance(replacements, list)
+            else []
+        )
+    return tuple(sorted({item for item in raw if isinstance(item, str) and item}))
+
+
 def validate_resumable_state(
     state: Mapping[str, Any],
     *,
@@ -981,6 +1320,7 @@ def validate_resumable_state(
     initial_active_nodes: Sequence[str],
     initial_spare_nodes: Sequence[str],
     max_replacements: int,
+    same_topology_retries: int,
     training_artifact_root: Path,
 ) -> tuple[tuple[str, ...], tuple[str, ...], list[str], int, int, bool]:
     """Validate durable state and return the exact continuation point."""
@@ -1030,7 +1370,8 @@ def validate_resumable_state(
         raise RecoveryError("recovery state topology or replacement counts differ")
 
     attempts = state.get("attempts")
-    if not isinstance(attempts, list) or len(attempts) > max_replacements + 1:
+    max_attempts = maximum_attempt_count(max_replacements, same_topology_retries)
+    if not isinstance(attempts, list) or len(attempts) > max_attempts:
         raise RecoveryError("recovery state attempts are invalid")
     artifact_root = training_artifact_root.resolve()
     for index, item in enumerate(attempts):
@@ -1049,6 +1390,7 @@ def validate_resumable_state(
                 "FAIL",
                 "PASS",
                 "REPLACED",
+                "RETRY_SAME_TOPOLOGY",
                 "MANUAL_REQUIRED",
                 "STOPPED",
             }
@@ -1084,8 +1426,14 @@ def validate_resumable_state(
         raise RecoveryError(f"{status} recovery state has no attempt")
     latest = attempts[-1]
     if status == "RETRYING":
-        if latest.get("status") != "REPLACED":
-            raise RecoveryError("RETRYING recovery state lacks a replaced attempt")
+        if latest.get("status") not in {"REPLACED", "RETRY_SAME_TOPOLOGY"}:
+            raise RecoveryError("RETRYING recovery state lacks a recovery action")
+        if latest.get("status") == "RETRY_SAME_TOPOLOGY" and latest.get(
+            "recoveryAction"
+        ) != "same-topology":
+            raise RecoveryError("same-topology retry record is invalid")
+        if same_topology_retries_used(attempts) > same_topology_retries:
+            raise RecoveryError("same-topology retry budget differs from state")
         return (
             active_nodes,
             spare_nodes,
@@ -1165,8 +1513,6 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
         )
     if args.cleanup_timeout_seconds <= 0:
         raise RecoveryError("cleanup timeout must be positive")
-    attempt_run_id(job_id, max_replacements)
-
     state_dir = args.recovery_state_root.resolve() / job_id
     state_path = state_dir / "state.json"
     stop_request_path = state_dir / training_control.STOP_REQUEST_FILENAME
@@ -1181,6 +1527,18 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
     state: dict[str, Any] | None = None
     if state_file_present:
         state = load_recovery_state(state_path, expected_job_id=job_id)
+    recovery_policy = apply_frozen_recovery_policy(args, state)
+    if state is not None and state.get("status") in TERMINAL_STATE_STATUSES:
+        terminal_status = state["status"]
+        print(
+            f"Recovery job {job_id} is already terminal: {terminal_status}",
+            flush=True,
+        )
+        return 0 if terminal_status in {"PASS", "STOPPED"} else 1
+    max_attempts = maximum_attempt_count(
+        max_replacements, recovery_policy["sameTopologyRetries"]
+    )
+    attempt_run_id(job_id, max_attempts - 1)
     if state_dir.exists() and not state_file_present:
         try:
             entries = {entry.name for entry in state_dir.iterdir()}
@@ -1209,7 +1567,11 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
         existing_state=state,
     )
     args.train_script = snapshot_path
-    expected_npus = source_declared_npus(snapshot_path)
+    # Validate the recipe declaration, but use the frozen accelerator profile
+    # for node health.  A recipe's initial NPUS_PER_NODE is later rewritten
+    # from the generated HCCL topology and is not a scheduling contract.
+    source_declared_npus(snapshot_path)
+    expected_npus = args.devices_per_node
 
     initial_args = copy.copy(args)
     initial_args.node = list(initial_active_nodes)
@@ -1218,13 +1580,6 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
     start_ray.validate_args(initial_args, attempt_run_id(job_id, 0))
 
     if state is not None:
-        terminal_status = state.get("status")
-        if terminal_status in TERMINAL_STATE_STATUSES:
-            print(
-                f"Recovery job {job_id} is already terminal: {terminal_status}",
-                flush=True,
-            )
-            return 0 if terminal_status in {"PASS", "STOPPED"} else 1
         (
             active_nodes,
             spare_nodes,
@@ -1238,12 +1593,13 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
             initial_active_nodes=initial_active_nodes,
             initial_spare_nodes=initial_spare_nodes,
             max_replacements=max_replacements,
+            same_topology_retries=recovery_policy["sameTopologyRetries"],
             training_artifact_root=args.training_artifact_root,
         )
         print(f"Recovery job ID: {job_id} (reattaching)", flush=True)
         print(f"Recovery state: {state_path}", flush=True)
     else:
-        for possible_attempt in range(max_replacements + 1):
+        for possible_attempt in range(max_attempts):
             possible_dir = (
                 args.training_artifact_root.resolve()
                 / attempt_run_id(job_id, possible_attempt)
@@ -1268,6 +1624,7 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
             "remainingSpareCount": len(initial_spare_nodes),
             "maxReplacementCount": max_replacements,
             "replacementCount": 0,
+            "recoveryPolicy": recovery_policy,
             "quarantinedNodes": [],
             "attempts": [],
             "createdAt": utc_now(),
@@ -1296,12 +1653,18 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
             job_id=job_id,
         )
         if stop_request is not None:
-            if stop_request.get("attemptRunId") != run_id:
+            accepted_attempts = {run_id}
+            if state.get("status") == "RETRYING" and state.get("attempts"):
+                latest_run_id = state["attempts"][-1].get("runId")
+                if isinstance(latest_run_id, str):
+                    accepted_attempts.add(latest_run_id)
+            if stop_request.get("attemptRunId") not in accepted_attempts:
                 raise RecoveryError("stop request belongs to another attempt")
-            state["status"] = "STOPPED"
-            state["stopRequest"] = stop_request
-            state["updatedAt"] = utc_now()
-            write_state(state_path, state)
+            record_stopped_state(
+                state_path=state_path,
+                state=state,
+                stop_request=stop_request,
+            )
             print(
                 "STOP: accepted user stop request; no new recovery attempt "
                 "will be started.",
@@ -1324,9 +1687,53 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
         )
         failed_stage: dict[str, Any] = {}
 
+        def stop_for_manual_without_cleanup(reason: str) -> int:
+            attempt_state["status"] = "MANUAL_REQUIRED"
+            attempt_state["connectionState"] = "UNCERTAIN"
+            attempt_state["recoveryFailure"] = reason[:1000]
+            attempt_state["finishedAt"] = utc_now()
+            attempt_state["returncode"] = 1
+            state["status"] = "MANUAL_REQUIRED"
+            state["activeNodes"] = list(active_nodes)
+            state["spareNodes"] = list(spare_nodes)
+            state["remainingSpareCount"] = len(spare_nodes)
+            state["replacementCount"] = replacements_used
+            state["quarantinedNodes"] = list(quarantined)
+            state["updatedAt"] = utc_now()
+            write_state(state_path, state)
+            emit_manual_required_alert(
+                attempt_args,
+                job_id=job_id,
+                reason=reason,
+            )
+            print(
+                "STOP: Ray Job state is uncertain; automatic cleanup was not "
+                "started and existing resources were retained: "
+                f"{reason}",
+                file=sys.stderr,
+            )
+            return 1
+
         def handle_stage_failure(index: int, name: str) -> None:
             failed_stage["index"] = index
             failed_stage["name"] = name
+            submission_uncertain = (
+                name == "formal Ray training"
+                and not (result_path.exists() or result_path.is_symlink())
+            )
+            if submission_uncertain:
+                attempt_state["connectionState"] = "UNCERTAIN"
+                state["status"] = "RUNNING"
+                state["updatedAt"] = utc_now()
+                write_state(state_path, state)
+                return
+            attempt_state["status"] = "FAIL"
+            attempt_state["failedStageIndex"] = index
+            attempt_state["failedStageName"] = name
+            attempt_state.setdefault("returncode", 1)
+            state["status"] = "WAITING_FOR_CLEANUP"
+            state["updatedAt"] = utc_now()
+            write_state(state_path, state)
             if name == "formal training parameter injection":
                 start_ray.retain_then_delete_cluster(attempt_args)
 
@@ -1335,54 +1742,176 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
             if not isinstance(attempts, list) or not isinstance(attempts[-1], dict):
                 raise RecoveryError("latest recovery attempt is no longer trustworthy")
             attempt_state = attempts[-1]
-            terminal_status = existing_training_result_status(
-                result_path,
-                expected_run_id=run_id,
-            )
-            if terminal_status is None:
-                if state.get("status") != "RUNNING":
-                    raise RecoveryError(
-                        "recovery phase requires a recorded FAIL result"
-                    )
-                try:
-                    ray_training_submit.load_submission_record(
-                        submission_path,
-                        expected_run_id=run_id,
-                        expected_namespace=attempt_args.namespace,
-                        expected_cluster=attempt_args.cluster,
-                    )
-                    ray_training_submit.resume_existing_submission(
-                        expected_run_id=run_id,
-                        kubectl_command=attempt_args.kubectl_command,
-                        kubeconfig=attempt_args.kubeconfig.resolve(),
-                        namespace=attempt_args.namespace,
-                        cluster=attempt_args.cluster,
-                        result_path=result_path,
-                        failure_retention_seconds=0,
-                        poll_seconds=ray_training_submit.DEFAULT_POLL_SECONDS,
-                        keep_success_resources=bool(
-                            getattr(attempt_args, "keep_success_resources", False)
-                        ),
-                    )
-                except ray_training_submit.SubmitError as error:
-                    print(
-                        f"RECOVERY: existing Ray Job ended or could not be reattached: {error}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+            resume_phase = state.get("status")
+            if resume_phase in {"WAITING_FOR_CLEANUP", "DIAGNOSING"}:
+                returncode = attempt_state.get("returncode", 1)
+                if not isinstance(returncode, int) or returncode == 0:
+                    raise RecoveryError("recorded failed attempt has an invalid return code")
+                failed_stage["index"] = attempt_state.get("failedStageIndex")
+                failed_stage["name"] = attempt_state.get("failedStageName")
+            else:
                 terminal_status = existing_training_result_status(
                     result_path,
                     expected_run_id=run_id,
                 )
-                if terminal_status is None:
-                    raise RecoveryError(
-                        "Ray Job reattach produced no owned terminal result; "
-                        "the attempt was not resubmitted"
+                current_stage_index = attempt_state.get("currentStageIndex")
+                submission_present = submission_path.exists() or submission_path.is_symlink()
+                formal_stage_started = (
+                    terminal_status is not None
+                    or submission_present
+                    or current_stage_index == 6
+                )
+                if terminal_status is None and not formal_stage_started:
+                    failed_stage["index"] = current_stage_index
+                    failed_stage["name"] = attempt_state.get(
+                        "currentStageName", "supervisor startup"
                     )
-            returncode = 0 if terminal_status == "PASS" else 1
-            if returncode != 0:
-                failed_stage["index"] = 6
-                failed_stage["name"] = "formal Ray training"
+                    returncode = 1
+                    attempt_state["status"] = "FAIL"
+                    attempt_state["failedStageIndex"] = failed_stage["index"]
+                    attempt_state["failedStageName"] = failed_stage["name"]
+                    state["status"] = "WAITING_FOR_CLEANUP"
+                    state["updatedAt"] = utc_now()
+                    write_state(state_path, state)
+                elif terminal_status is None:
+                    if resume_phase != "RUNNING":
+                        raise RecoveryError(
+                            "recovery phase requires a recorded FAIL result"
+                        )
+                    try:
+                        ray_training_submit.load_submission_record(
+                            submission_path,
+                            expected_run_id=run_id,
+                            expected_namespace=attempt_args.namespace,
+                            expected_cluster=attempt_args.cluster,
+                        )
+                    except ray_training_submit.SubmitError as error:
+                        try:
+                            cluster_present = query_owned_raycluster(
+                                kubectl=kubectl_prefix(
+                                    attempt_args.kubectl_command,
+                                    attempt_args.kubeconfig.resolve(),
+                                ),
+                                namespace=attempt_args.namespace,
+                                cluster=attempt_args.cluster,
+                                run_id=run_id,
+                            ) is not None
+                        except RecoveryError as query_error:
+                            return stop_for_manual_without_cleanup(
+                                "submission record is invalid and RayCluster "
+                                f"ownership cannot be proved: {error}; {query_error}"
+                            )
+                        if cluster_present:
+                            return stop_for_manual_without_cleanup(
+                                "submission record is missing or invalid while "
+                                f"the owned RayCluster still exists: {error}"
+                            )
+                        returncode = 1
+                        failed_stage["index"] = 6
+                        failed_stage["name"] = "formal Ray training"
+                    else:
+                        while terminal_status is None:
+                            stop_request = accepted_stop_request(
+                                stop_request_path,
+                                job_id=job_id,
+                            )
+                            if stop_request is not None:
+                                if stop_request.get("attemptRunId") != run_id:
+                                    raise RecoveryError(
+                                        "stop request belongs to another attempt"
+                                    )
+                                returncode = 1
+                                failed_stage["index"] = 6
+                                failed_stage["name"] = "formal Ray training"
+                                break
+                            try:
+                                ray_training_submit.resume_existing_submission(
+                                    expected_run_id=run_id,
+                                    kubectl_command=attempt_args.kubectl_command,
+                                    kubeconfig=attempt_args.kubeconfig.resolve(),
+                                    namespace=attempt_args.namespace,
+                                    cluster=attempt_args.cluster,
+                                    result_path=result_path,
+                                    failure_retention_seconds=0,
+                                    poll_seconds=(
+                                        ray_training_submit.DEFAULT_POLL_SECONDS
+                                    ),
+                                    keep_success_resources=bool(
+                                        getattr(
+                                            attempt_args,
+                                            "keep_success_resources",
+                                            False,
+                                        )
+                                    ),
+                                )
+                                reattach_error: Exception | None = None
+                            except ray_training_submit.SubmitError as error:
+                                reattach_error = error
+                            terminal_status = existing_training_result_status(
+                                result_path,
+                                expected_run_id=run_id,
+                            )
+                            if terminal_status is not None:
+                                break
+                            try:
+                                cluster_present = query_owned_raycluster(
+                                    kubectl=kubectl_prefix(
+                                        attempt_args.kubectl_command,
+                                        attempt_args.kubeconfig.resolve(),
+                                    ),
+                                    namespace=attempt_args.namespace,
+                                    cluster=attempt_args.cluster,
+                                    run_id=run_id,
+                                ) is not None
+                            except RecoveryOwnershipError as error:
+                                return stop_for_manual_without_cleanup(str(error))
+                            except RecoveryError as error:
+                                cluster_present = True
+                                reattach_error = reattach_error or error
+                            if not cluster_present:
+                                returncode = 1
+                                failed_stage["index"] = 6
+                                failed_stage["name"] = "formal Ray training"
+                                break
+                            detail = str(
+                                reattach_error
+                                or "reattach returned without a terminal result"
+                            )
+                            attempt_state["connectionState"] = "UNCERTAIN"
+                            attempt_state["lastConnectionFailure"] = detail[:1000]
+                            state["status"] = "RUNNING"
+                            state["updatedAt"] = utc_now()
+                            write_state(state_path, state)
+                            print(
+                                "WARNING: Ray Job connection remains uncertain; "
+                                "the owned RayCluster is still present and will "
+                                f"not be cleaned up: {detail}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            retry_deadline = time.monotonic() + 30
+                            while time.monotonic() < retry_deadline:
+                                if accepted_stop_request(
+                                    stop_request_path,
+                                    job_id=job_id,
+                                ) is not None:
+                                    break
+                                time.sleep(
+                                    min(
+                                        1.0,
+                                        max(
+                                            0.0,
+                                            retry_deadline - time.monotonic(),
+                                        ),
+                                    )
+                                )
+                if terminal_status is not None:
+                    returncode = 0 if terminal_status == "PASS" else 1
+                    attempt_state.pop("connectionState", None)
+                    attempt_state.pop("lastConnectionFailure", None)
+                    if returncode != 0:
+                        failed_stage["index"] = 6
+                        failed_stage["name"] = "formal Ray training"
             attempt_state.setdefault("finishedAt", utc_now())
             attempt_state["returncode"] = returncode
             resume_current_attempt = False
@@ -1419,11 +1948,15 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
                     stop_request_path,
                     job_id=job_id,
                 )
-                if request is None:
-                    return True
-                if request.get("attemptRunId") != run_id:
-                    raise RecoveryError("stop request belongs to another attempt")
-                return False
+                if request is not None:
+                    if request.get("attemptRunId") != run_id:
+                        raise RecoveryError("stop request belongs to another attempt")
+                    return False
+                attempt_state["currentStageIndex"] = _index
+                attempt_state["currentStageName"] = _name
+                state["updatedAt"] = utc_now()
+                write_state(state_path, state)
+                return True
 
             returncode = start_ray.execute_pipeline(
                 stages,
@@ -1432,6 +1965,26 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
             )
             attempt_state["finishedAt"] = utc_now()
             attempt_state["returncode"] = returncode
+            if (
+                returncode != 0
+                and attempt_state.get("connectionState") == "UNCERTAIN"
+                and not (result_path.exists() or result_path.is_symlink())
+            ):
+                stop_request = accepted_stop_request(
+                    stop_request_path,
+                    job_id=job_id,
+                )
+                if stop_request is None:
+                    attempt_state.pop("finishedAt", None)
+                    attempt_state.pop("returncode", None)
+                    resume_current_attempt = True
+                    print(
+                        "RECOVERY: Ray Job connection is uncertain; retaining "
+                        "the running cluster and reattaching without resubmission.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
         stop_request = accepted_stop_request(
             stop_request_path,
             job_id=job_id,
@@ -1451,21 +2004,13 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
                 )
             except RecoveryError as error:
                 cleanup_failure = str(error)
-            attempt_state["status"] = "STOPPED"
-            attempt_state["stopRequest"] = stop_request
-            if cleanup_failure is not None:
-                attempt_state["cleanupFailure"] = cleanup_failure
-            state["status"] = "STOPPED"
-            state["stopRequest"] = stop_request
-            if cleanup_failure is not None:
-                state["cleanupFailure"] = cleanup_failure
-            state["activeNodes"] = list(active_nodes)
-            state["spareNodes"] = list(spare_nodes)
-            state["remainingSpareCount"] = len(spare_nodes)
-            state["replacementCount"] = replacements_used
-            state["quarantinedNodes"] = list(quarantined)
-            state["updatedAt"] = utc_now()
-            write_state(state_path, state)
+            record_stopped_state(
+                state_path=state_path,
+                state=state,
+                stop_request=stop_request,
+                attempt_state=attempt_state,
+                cleanup_failure=cleanup_failure,
+            )
             print(
                 "STOP: training ended in response to the accepted user stop "
                 "request; automatic recovery is disabled.",
@@ -1493,6 +2038,11 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
                 state["quarantinedNodes"] = list(quarantined)
                 state["updatedAt"] = utc_now()
                 write_state(state_path, state)
+                emit_manual_required_alert(
+                    attempt_args,
+                    job_id=job_id,
+                    reason=f"successful result validation failed: {error}",
+                )
                 print(
                     "STOP: successful pipeline result could not prove checkpoint "
                     f"recovery: {error}",
@@ -1512,22 +2062,58 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
         attempt_state["failedStageIndex"] = failed_stage.get("index")
         attempt_state["failedStageName"] = failed_stage.get("name")
         try:
-            if failed_stage.get("name") != "formal Ray training":
-                raise RecoveryError(
-                    "only a failure in the formal Ray training stage is "
-                    "eligible for automatic node replacement"
-                )
-            failure_result = load_failed_training_result(
-                result_path,
-                expected_run_id=run_id,
-            )
-            attempt_state["trainingResult"] = compact_training_result_for_state(
-                failure_result
-            )
-
             state["status"] = "WAITING_FOR_CLEANUP"
             state["updatedAt"] = utc_now()
             write_state(state_path, state)
+
+            failure_result: Mapping[str, Any] | None = None
+            failure_class: str | None = None
+            if failed_stage.get("name") == "formal Ray training":
+                try:
+                    failure_result = load_failed_training_result(
+                        result_path,
+                        expected_run_id=run_id,
+                    )
+                except RecoveryError as error:
+                    attempt_state["trainingResultFailure"] = str(error)
+                    if result_path.exists() or result_path.is_symlink():
+                        return stop_for_manual_without_cleanup(
+                            "formal training result exists but is not a trusted "
+                            f"FAIL result: {error}"
+                        )
+                    try:
+                        cluster_present = query_owned_raycluster(
+                            kubectl=kubectl_prefix(
+                                attempt_args.kubectl_command,
+                                attempt_args.kubeconfig.resolve(),
+                            ),
+                            namespace=attempt_args.namespace,
+                            cluster=attempt_args.cluster,
+                            run_id=run_id,
+                        ) is not None
+                    except RecoveryError as query_error:
+                        return stop_for_manual_without_cleanup(
+                            "formal training produced no trusted result and "
+                            "RayCluster ownership cannot be proved: "
+                            f"{error}; {query_error}"
+                        )
+                    if cluster_present:
+                        return stop_for_manual_without_cleanup(
+                            "formal training produced no trusted result while "
+                            "the owned RayCluster still exists"
+                        )
+                else:
+                    attempt_state["trainingResult"] = (
+                        compact_training_result_for_state(failure_result)
+                    )
+                    raw_failure_class = failure_result.get("failureClass")
+                    if isinstance(raw_failure_class, str):
+                        failure_class = raw_failure_class
+                    if failure_class == "CHECKPOINT_UNAVAILABLE":
+                        attempt_state["checkpointFailure"] = failure_result.get(
+                            "checkpoint"
+                        )
+
             wait_for_cluster_cleanup(
                 kubectl_command=attempt_args.kubectl_command,
                 kubeconfig=attempt_args.kubeconfig.resolve(),
@@ -1537,96 +2123,197 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
                 timeout_seconds=args.cleanup_timeout_seconds,
             )
 
-            failure_class = failure_result.get("failureClass")
-            if failure_class in {
-                "DRIVER_INTERNAL_FAILURE",
-                "DRIVER_PROTOCOL_FAILURE",
-                "INTERRUPTED",
-            }:
-                raise RecoveryError(
-                    "formal Ray driver failed internally or was interrupted; "
-                    "automatic node replacement is not allowed"
-                )
-            if failure_class == "CHECKPOINT_UNAVAILABLE":
-                checkpoint_result = failure_result.get("checkpoint")
-                attempt_state["checkpointFailure"] = checkpoint_result
-                raise RecoveryError(
-                    "latest committed checkpoint is unavailable or differs "
-                    "between active workers"
-                )
-
-            state["status"] = "DIAGNOSING"
-            state["updatedAt"] = utc_now()
-            write_state(state_path, state)
-            diagnosis = recovery_diagnostics.diagnose_replacement(
-                kubectl_command=attempt_args.kubectl_command,
-                kubeconfig=attempt_args.kubeconfig.resolve(),
-                active_nodes=active_nodes,
-                spare_nodes=spare_nodes,
-                expected_npus=expected_npus,
-                npu_resource=attempt_args.npu_resource,
-                exporter_app=attempt_args.npu_exporter_app,
-                exporter_port=attempt_args.npu_exporter_port,
+            stop_request = accepted_stop_request(
+                stop_request_path,
+                job_id=job_id,
             )
-            attempt_state["diagnosis"] = diagnosis
-            if not diagnosis.get("replacementAllowed") or not diagnosis.get(
-                "restartReady"
-            ):
-                reasons = diagnosis.get("reasons")
-                detail = "; ".join(str(reason) for reason in reasons or [])
-                raise RecoveryError(detail or "one-shot diagnosis found no safe replacement")
-
-            replacements = diagnosis.get("replacements")
-            if not isinstance(replacements, list) or not replacements:
-                raise RecoveryError("diagnosis allowed replacement without a replacement list")
-            if diagnosis.get("replacementCount") not in (None, len(replacements)):
-                raise RecoveryError("diagnosis replacement count is inconsistent")
-            if replacements_used + len(replacements) > max_replacements:
-                raise RecoveryError(
-                    "diagnosed failures exceed the configured spare replacement budget"
+            if stop_request is not None:
+                if stop_request.get("attemptRunId") != run_id:
+                    raise RecoveryError("stop request belongs to another attempt")
+                record_stopped_state(
+                    state_path=state_path,
+                    state=state,
+                    stop_request=stop_request,
+                    attempt_state=attempt_state,
                 )
-            if len(replacements) > len(spare_nodes):
-                raise RecoveryError(
-                    "diagnosed failures exceed the currently recorded spare count"
-                )
-
-            # Build the complete N-for-N update on local immutable tuples first.
-            # The supervisor state is changed only after every pair validates,
-            # so a malformed second pair cannot leave a partial replacement.
-            next_active = active_nodes
-            next_spares = spare_nodes
-            replacement_records: list[dict[str, str]] = []
-            for replacement in replacements:
-                if not isinstance(replacement, Mapping):
-                    raise RecoveryError("diagnosis returned an invalid replacement entry")
-                bad_value = replacement.get("failedNode")
-                spare_value = replacement.get("spareNode")
-                if not isinstance(bad_value, str) or not bad_value:
-                    raise RecoveryError("diagnosis omitted a failed active target")
-                if not isinstance(spare_value, str) or not spare_value:
-                    raise RecoveryError("diagnosis omitted a spare target")
-                next_active, next_spares = replace_active_node(
-                    next_active,
-                    next_spares,
-                    bad_target=bad_value,
-                    replacement_target=spare_value,
-                )
-                replacement_records.append(
-                    {"badTarget": bad_value, "replacementTarget": spare_value}
-                )
-
-            active_nodes = next_active
-            spare_nodes = next_spares
-            replacements_used += len(replacement_records)
-            quarantined.extend(item["badTarget"] for item in replacement_records)
-            attempt_state["status"] = "REPLACED"
-            attempt_state["replacements"] = replacement_records
-            attempt_state["replacementCount"] = len(replacement_records)
-            for replacement in replacement_records:
                 print(
-                    "RECOVERY: replacing failed active node "
-                    f"{replacement['badTarget']} with spare "
-                    f"{replacement['replacementTarget']}.",
+                    "STOP: accepted user stop request during recovery; no new "
+                    "attempt will be started.",
+                    file=sys.stderr,
+                )
+                return 0
+
+            diagnosis_summary: Mapping[str, Any] | None = None
+            if failure_class not in NON_NODE_FAILURE_CLASSES:
+                state["status"] = "DIAGNOSING"
+                state["updatedAt"] = utc_now()
+                write_state(state_path, state)
+
+                def diagnose_once() -> Mapping[str, Any]:
+                    return recovery_diagnostics.diagnose_replacement(
+                        kubectl_command=attempt_args.kubectl_command,
+                        kubeconfig=attempt_args.kubeconfig.resolve(),
+                        active_nodes=active_nodes,
+                        spare_nodes=spare_nodes,
+                        expected_npus=expected_npus,
+                        npu_resource=attempt_args.npu_resource,
+                        exporter_app=attempt_args.npu_exporter_app,
+                        exporter_port=attempt_args.npu_exporter_port,
+                    )
+
+                def diagnosis_sleep(seconds: float) -> None:
+                    deadline = time.monotonic() + seconds
+                    while time.monotonic() < deadline:
+                        if accepted_stop_request(
+                            stop_request_path,
+                            job_id=job_id,
+                        ) is not None:
+                            raise RecoveryStopRequested
+                        time.sleep(
+                            min(1.0, max(0.0, deadline - time.monotonic()))
+                        )
+
+                try:
+                    diagnosis_summary = (
+                        recovery_diagnostics.diagnose_stable_replacement(
+                            diagnose_once,
+                            stable_samples=recovery_policy[
+                                "diagnosisStableSamples"
+                            ],
+                            max_samples=diagnosis_sample_limit(
+                                recovery_policy["diagnosisWindowSeconds"],
+                                recovery_policy["diagnosisPollSeconds"],
+                            ),
+                            poll_seconds=recovery_policy[
+                                "diagnosisPollSeconds"
+                            ],
+                            sleep_fn=diagnosis_sleep,
+                        )
+                    )
+                except RecoveryStopRequested:
+                    stop_request = accepted_stop_request(
+                        stop_request_path,
+                        job_id=job_id,
+                    )
+                    if (
+                        stop_request is None
+                        or stop_request.get("attemptRunId") != run_id
+                    ):
+                        raise RecoveryError(
+                            "diagnosis stop request belongs to another attempt"
+                        )
+                    record_stopped_state(
+                        state_path=state_path,
+                        state=state,
+                        stop_request=stop_request,
+                        attempt_state=attempt_state,
+                    )
+                    print(
+                        "STOP: accepted user stop request during diagnosis; "
+                        "no new attempt will be started.",
+                        file=sys.stderr,
+                    )
+                    return 0
+                latest_diagnosis = diagnosis_summary.get("latestDiagnosis")
+                if isinstance(latest_diagnosis, Mapping):
+                    attempt_state["diagnosis"] = dict(latest_diagnosis)
+                attempt_state["diagnosisSummary"] = {
+                    "stable": diagnosis_summary.get("stable") is True,
+                    "sampleCount": diagnosis_summary.get("sampleCount"),
+                    "confirmedFailedNodes": diagnosis_summary.get(
+                        "confirmedFailedNodes", []
+                    ),
+                    "reason": diagnosis_summary.get("reason"),
+                }
+
+            if diagnosis_summary is not None and diagnosis_summary.get("stable") is True:
+                diagnosis = diagnosis_summary.get("latestDiagnosis")
+                if not isinstance(diagnosis, Mapping):
+                    raise RecoveryError("stable diagnosis has no latest snapshot")
+                replacements = diagnosis.get("replacements")
+                if not isinstance(replacements, list) or not replacements:
+                    raise RecoveryError(
+                        "diagnosis allowed replacement without a replacement list"
+                    )
+                if diagnosis.get("replacementCount") not in (None, len(replacements)):
+                    raise RecoveryError("diagnosis replacement count is inconsistent")
+                if replacements_used + len(replacements) > max_replacements:
+                    raise RecoveryError(
+                        "diagnosed failures exceed the configured spare replacement budget"
+                    )
+                if len(replacements) > len(spare_nodes):
+                    raise RecoveryError(
+                        "diagnosed failures exceed the currently recorded spare count"
+                    )
+
+                next_active = active_nodes
+                next_spares = spare_nodes
+                replacement_records: list[dict[str, str]] = []
+                for replacement in replacements:
+                    if not isinstance(replacement, Mapping):
+                        raise RecoveryError(
+                            "diagnosis returned an invalid replacement entry"
+                        )
+                    bad_value = replacement.get("failedNode")
+                    spare_value = replacement.get("spareNode")
+                    if not isinstance(bad_value, str) or not bad_value:
+                        raise RecoveryError("diagnosis omitted a failed active target")
+                    if not isinstance(spare_value, str) or not spare_value:
+                        raise RecoveryError("diagnosis omitted a spare target")
+                    next_active, next_spares = replace_active_node(
+                        next_active,
+                        next_spares,
+                        bad_target=bad_value,
+                        replacement_target=spare_value,
+                    )
+                    replacement_records.append(
+                        {"badTarget": bad_value, "replacementTarget": spare_value}
+                    )
+
+                active_nodes = next_active
+                spare_nodes = next_spares
+                replacements_used += len(replacement_records)
+                quarantined.extend(
+                    item["badTarget"] for item in replacement_records
+                )
+                attempt_state["status"] = "REPLACED"
+                attempt_state["recoveryAction"] = "replace"
+                attempt_state["replacements"] = replacement_records
+                attempt_state["replacementCount"] = len(replacement_records)
+                for replacement in replacement_records:
+                    print(
+                        "RECOVERY: replacing failed active node "
+                        f"{replacement['badTarget']} with spare "
+                        f"{replacement['replacementTarget']}.",
+                        flush=True,
+                    )
+            else:
+                latest_diagnosis = (
+                    diagnosis_summary.get("latestDiagnosis")
+                    if diagnosis_summary is not None
+                    else None
+                )
+                unsafe_nodes = diagnosed_failed_nodes(latest_diagnosis)
+                if unsafe_nodes:
+                    raise RecoveryError(
+                        "node health remained unsafe but did not meet the stable, "
+                        "restart-ready replacement rule: " + ", ".join(unsafe_nodes)
+                    )
+                retries_used = same_topology_retries_used(state["attempts"])
+                retry_limit = recovery_policy["sameTopologyRetries"]
+                if retries_used >= retry_limit:
+                    detail = (
+                        f"{failure_class or failed_stage.get('name') or 'unknown failure'}; "
+                        f"same-topology retry budget {retry_limit} exhausted"
+                    )
+                    raise RecoveryError(detail)
+                retry_number = retries_used + 1
+                attempt_state["status"] = "RETRY_SAME_TOPOLOGY"
+                attempt_state["recoveryAction"] = "same-topology"
+                attempt_state["sameTopologyRetry"] = retry_number
+                print(
+                    "RECOVERY: no stable hardware failure was confirmed; "
+                    f"retrying the same topology ({retry_number}/{retry_limit}).",
                     flush=True,
                 )
         except RecoveryError as error:
@@ -1640,10 +2327,14 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
             state["quarantinedNodes"] = list(quarantined)
             state["updatedAt"] = utc_now()
             write_state(state_path, state)
+            emit_manual_required_alert(
+                attempt_args,
+                job_id=job_id,
+                reason=str(error),
+            )
             print(f"STOP: automatic recovery refused: {error}", file=sys.stderr)
             return returncode or 1
 
-        attempt += 1
         state["status"] = "RETRYING"
         state["activeNodes"] = list(active_nodes)
         state["spareNodes"] = list(spare_nodes)
@@ -1652,6 +2343,30 @@ def _run_supervisor_locked(args: argparse.Namespace) -> int:
         state["quarantinedNodes"] = list(quarantined)
         state["updatedAt"] = utc_now()
         write_state(state_path, state)
+        if attempt_state.get("recoveryAction") == "same-topology":
+            deadline = time.monotonic() + recovery_policy["retryBackoffSeconds"]
+            while time.monotonic() < deadline:
+                stop_request = accepted_stop_request(
+                    stop_request_path,
+                    job_id=job_id,
+                )
+                if stop_request is not None:
+                    if stop_request.get("attemptRunId") != run_id:
+                        raise RecoveryError("stop request belongs to another attempt")
+                    record_stopped_state(
+                        state_path=state_path,
+                        state=state,
+                        stop_request=stop_request,
+                        attempt_state=attempt_state,
+                    )
+                    print(
+                        "STOP: accepted user stop request during retry backoff; "
+                        "no new attempt will be started.",
+                        file=sys.stderr,
+                    )
+                    return 0
+                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+        attempt += 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:

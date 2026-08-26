@@ -98,7 +98,7 @@ iteration 后执行同一停止。后者保持前台等待，`Ctrl-C` 仅取消 
 项目根目录的 `config/cluster.yaml` 是日常运行默认值的唯一入口。当前完整结构为：
 
 ```yaml
-schemaVersion: kcc-ray-config/v1
+schemaVersion: kcc-ray-config/v2
 kubernetes:
   kubectlCommand: /usr/local/bin/k3s kubectl
   kubeconfig: /home/ywj/.kube/k3s-learning.yaml
@@ -114,14 +114,24 @@ topology:
     - gpu-server-05
     - gpu-server-06
   spareNodes: [gpu-server-07, gpu-server-08]
-npuCheck:
+  headSelector: {}
+  workerSelector: {}
+accelerator:
   resourceName: huawei.com/Ascend910
+  devicesPerNode: 8
+  runtimeClassName: ascend
+images:
+  rayHead: 110.120.0.3:8889/pretrain/ray-head@sha256:121fff1a4b0f991121ba7dc85cbb7a77643d28c79cc355ba3f1536abb51c865b
+  rayWorker: 110.120.0.3:8889/ascendhub/verl_pt27_25rc3@sha256:0c263b4d1989bf41a38f0fe560c60b97b0f4e670f1a4378319dc98117ac4113c
+  pullPolicy: IfNotPresent
+npuCheck:
   exporterNamespace: npu-exporter
   exporterApp: npu-exporter
   exporterPort: 8082
 training:
   defaultTemplate: ../ray_startup_bundle/training_templates/pretrain_150M.sh
   workingDirectory: /mnt/models/CODE/MindSpeed-LLM-v2.3.0
+  workspaceHostPath: /mnt/models
 supervisor:
   node: server-00
   serviceAccount: pretrain-ray-supervisor
@@ -136,6 +146,13 @@ timeouts:
   trainingSeconds: 0
   failedResourceRetentionSeconds: 1800
   recoveryCleanupSeconds: 300
+recovery:
+  sameTopologyRetries: 2
+  retryBackoffSeconds: 60
+  noProgressSeconds: 3600
+  diagnosisWindowSeconds: 300
+  diagnosisPollSeconds: 30
+  diagnosisStableSamples: 2
 ```
 
 `check` 和 `--all-nodes` 都由两组节点派生，不再维护额外列表。外层 Supervisor Job 会把创建时
@@ -146,8 +163,9 @@ timeouts:
 
 模型结构、数据与 tokenizer 路径、checkpoint 读写路径、batch size、学习率和保存
 间隔不放在这个文件中，仍只修改 `training.defaultTemplate` 指向的训练模板。Ray
-容器镜像、CPU/内存/NPU 数量、挂载和 runtimeClass 仍只修改 `raycluster.yaml`，
-避免同一训练含义出现两份配置。
+容器镜像、CPU/内存和挂载仍由 `raycluster.yaml` 提供；NPU 扩展资源名、每节点
+申请数量、runtimeClass 与 head/worker selector 由 `accelerator` 和 `topology` 提供，
+渲染时整体覆盖模板值。A3 示例见 `config/cluster.a3.yaml`。
 
 每次机器数不同时重复传 `--node` 即可，worker 数由节点列表自动得出：
 
@@ -177,18 +195,21 @@ kcc_ray start --run-id pretrain-150m-20260803
 显式传入重复的 `--node` 或 `--spare-node` 会分别临时覆盖对应默认列表。
 
 `--run-id` 在这里是逻辑任务 ID；实际每轮证据使用
-`<run-id>-a00`、`<run-id>-a01`。正式训练明确导出 `FAIL` 后，恢复入口会：
+`<run-id>-a00`、`<run-id>-a01`。任一阶段明确失败后，恢复入口会：
 
 1. 重发当前 RayCluster 的幂等删除，等待旧 RayCluster、Pod、Service 和
    RankTable ConfigMap 全部消失；删除 Pod 会结束该 RayCluster 内的旧训练进程。
-2. 只做一次 active + 当前剩余备用机快照。Node 消失或 NotReady、Kubernetes
-   NPU 数量不足、exporter 少卡或报卡异常均记为坏机；证据读不到记为 unknown。
-3. 只有所有存活 active 已空闲，且坏机数不大于健康、空闲备用机数时，才整批
+2. 对软件、网络、checkpoint、driver 和无进展等非硬件故障，先按冻结策略在相同
+   active 拓扑上有限重试；这些重试不消耗备用机。
+3. 在有界窗口内重复读取 active + 当前剩余备用机快照。Node 消失或 NotReady、
+   Kubernetes NPU 数量不足、exporter 少卡或报卡异常均记为坏机；证据读不到记为
+   unknown。只有相同故障节点连续达到阈值才采信。
+4. 只有所有存活 active 已空闲，且坏机数不大于健康、空闲备用机数时，才整批
    替换。备用机按声明顺序放入原 active 列表位置；新一轮实际 `node_rank` 仍由
    新发现的 Pod/RankTable 拓扑重新冻结，不假设物理机 rank 不变。
-4. 用替换后的完整 active 列表从六阶段起点创建新 Ray world；不会复用上一轮
+5. 用原拓扑或替换后的完整 active 列表从六阶段起点创建新 Ray world；不会复用上一轮
    actor、RankTable 或 checkpoint 检测结果。
-5. 新 world 的所有 worker 重新读取 `/mnt/models` 上最新已提交 checkpoint；
+6. 新 world 的所有 worker 重新读取 `/mnt/models` 上最新已提交 checkpoint；
    一致性检查通过后，训练脚本才按原来的 `--load`/`--save` 拉起 `torchrun`。
 
 ### 最新可恢复 checkpoint 的检测
@@ -213,18 +234,18 @@ kcc_ray start --run-id pretrain-150m-20260803
 各 worker 的 tracker 内容、tracker 摘要、所选目录、文件相对路径和文件大小还
 必须完全一致。这样，故障保存遗留的更大 `iter_*` 半成品不会被误选。tracker
 缺失/损坏、指向目录或文件不完整、值为 `release`，或者各 worker 视图不一致时，
-本轮导出 `CHECKPOINT_UNAVAILABLE`；恢复入口清理本轮 RayCluster 后写入
-`MANUAL_REQUIRED`，不会进入坏机诊断，也不会消耗备用机。平台不修改 tracker，
-也不会自动回退到更旧目录。文件内容以及模型/优化器参数是否真正兼容，仍由
-MindSpeed/Megatron 的正式加载做最终确认。
+本轮导出 `CHECKPOINT_UNAVAILABLE`；恢复入口清理本轮 RayCluster 后仅做有限的
+同拓扑重试，不会据此消耗备用机。重复失败并耗尽预算后写入
+`MANUAL_REQUIRED`。平台不修改 tracker，也不会自动回退到更旧目录。文件内容以及
+模型/优化器参数是否真正兼容，仍由 MindSpeed/Megatron 的正式加载做最终确认。
 
 checkpoint 内容错误和机器掉线分开处理：tracker/分片确实有问题时按上述规则
 人工处理；如果 worker 在 checkpoint 检查期间掉线、actor 丢失或 Ray RPC 失败，
 该轮记为 worker runtime failure，仍会在清理旧 world 后进入坏机诊断。actor
 身份检查、worker 预检和 checkpoint RPC 的等待上限均为 300 秒，避免共享存储
 或失联 actor 令 supervisor 无限等待。换机后的下一轮再从头检查 checkpoint，
-避免把机器故障误报成 checkpoint 损坏。driver 内部错误、协议证据异常和人为
-中断则清理后直接 `MANUAL_REQUIRED`，不会因软件错误消耗备用机。
+避免把机器故障误报成 checkpoint 损坏。driver 内部错误、协议证据异常和全局无
+进展同样只允许有限的同拓扑重试，不会因软件错误消耗备用机；人工停止标记始终优先。
 
 因此两个备用机既可以处理两轮各坏一台，也可以处理同一轮同时确认坏两台；
 若坏机多于剩余健康备用机、任一 active 状态不确定，或清理后 exporter 仍看到
@@ -236,13 +257,15 @@ NPU 进程，则停止并写入 `MANUAL_REQUIRED`，不会部分换机或扫描�
 log/training-jobs/<run-id>/state.json
 ```
 
-其中记录初始/剩余备用机数、累计替换数、隔离节点和每次 attempt 的诊断结果。
+其中记录冻结的恢复策略、初始/剩余备用机数、累计替换数、隔离节点和有上限的
+attempt 摘要。诊断只保留最后一次快照和固定大小摘要，正常训练期间不会持续追加。
 失败 attempt 保存坏机到备用机的 `replacements`；下一 attempt 保存替换后的
 `activeNodes`，并在结束时保存正式 `trainingResult`。只有该结果属于当前 run ID、
 状态为 `PASS`，且含全部 worker 一致的 checkpoint iteration/目录证据，整个恢复
 任务才会写成 `PASS`。
-恢复模式会把已确认失败的 RayCluster 保留时间强制为 0；checkpoint 和
-`/mnt/models` 中的训练日志不会被删除。
+恢复模式会把有可信 `FAIL` 证据的 RayCluster 保留时间强制为 0；状态不确定、结果
+缺失/损坏或 ownership 无法证明时不会自动清理。checkpoint 和 `/mnt/models` 中的
+训练日志不会被删除。
 
 默认正式模板是：
 
@@ -337,9 +360,9 @@ HCCL 成功后，`inject_training_params.py` 根据本次证据为每个 worker 
 - `inject_training_params.py`：读取 PASS 证据，创建每节点正式脚本和冻结清单。
 - `ray_training_submit.py`：把清单与 driver 复制到 Ray head，并用 Ray Jobs API 提交、查询和导出结果。
 - `ray_training_driver.py`：每个 worker 申请其全部 NPU，核对 Pod/RankTable/
-  `ms` 环境后并发执行正式脚本。
-- `recovery_supervisor.py`：失败清理、单次诊断、备用机计数、整批替换和重启。
-- `recovery_diagnostics.py`：一次性读取 Kubernetes/exporter 证据并给出
+  `ms` 环境后并发执行正式脚本，并由 rank 0 进行常量内存的无进展监测。
+- `recovery_supervisor.py`：失败清理、有限同拓扑重试、备用机计数、整批替换和重启。
+- `recovery_diagnostics.py`：读取 Kubernetes/exporter 快照，并用有界连续采样给出
   fail-closed 的 N 坏机换 N 备用机决策。
 - `training_templates/`：正式训练模板；运行时只修改生成的注入副本。
 - `raycluster.yaml`：按 namespace/cluster/head/NPU/worker 列表渲染的 Ray 基础模板，
@@ -392,13 +415,10 @@ fresh 模式改为写入同一存档目录：
 Namespace、checkpoint 和日志不会删除。训练状态不确定或结果未能导出时，
 RayCluster 会保留，避免误删仍在运行的任务。
 
-需要提前删除时，可中断等待进程后执行：
+需要提前停止并清理当前 owned RayCluster 时使用：
 
 ```bash
-/usr/local/bin/k3s kubectl \
-  --kubeconfig /home/ywj/.kube/k3s-learning.yaml \
-  delete raycluster pretrain-gpu00-gpu01 \
-  -n pretrain-ray --wait=false
+kcc_ray cancel --run-id <run-id>
 ```
 
 当前第 6 阶段通过 `ray_training_submit.py` 把 driver 提交给 Ray Jobs API。
@@ -410,7 +430,9 @@ RayCluster。恢复 Supervisor 由固定在 `supervisor.node` 的 Kubernetes Job
 已有结果会被验证并重放，否则只重连 create-only record 中的原 Ray Job。没有可信
 record 时不会重跑六阶段或重复 submit。
 Ray Job 状态默认每 30 秒查询一次；短暂失败按 5、10、20、30 秒退避，连续
-失败超过 300 秒才按状态不确定退出并保留 RayCluster。
+失败超过 300 秒时，内层连接会返回状态不确定；Supervisor 只要仍能确认 owned
+RayCluster 存在，就保留同一 attempt 并继续续接。只有可信终态结果或已确认消失的
+RayCluster 才会进入恢复流程。
 
 ## 为前端预留
 

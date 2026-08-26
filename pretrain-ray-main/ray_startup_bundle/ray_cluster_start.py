@@ -17,6 +17,8 @@ import tarfile
 import time
 from typing import Any, Mapping, Sequence
 
+import training_control
+
 
 RUNTIME_ARCHIVE_KEY = "hccl-check-src.tgz"
 MAX_RUNTIME_ARCHIVE_BYTES = 900_000
@@ -46,6 +48,49 @@ FATAL_WAITING_REASONS = {
 
 class StartError(RuntimeError):
     pass
+
+
+class StopRequested(StartError):
+    pass
+
+
+def raise_if_stop_requested(
+    stop_request: Path | None,
+    *,
+    run_id: str | None,
+) -> None:
+    if stop_request is None:
+        return
+    if run_id is None:
+        raise StartError("stop request path requires a run ID")
+    try:
+        request = training_control.load_compatible_stop_request(
+            stop_request,
+            expected_job_id=run_id,
+            expected_attempt=run_id,
+            current_cluster_uid=None,
+            expected_mode="IMMEDIATE",
+            expected_iteration=None,
+        )
+    except training_control.ControlError as error:
+        raise StartError(f"invalid stop request: {error}") from error
+    if request is not None:
+        raise StopRequested(f"immediate stop request accepted for run {run_id}")
+
+
+def sleep_with_stop_polling(
+    seconds: float,
+    *,
+    stop_request: Path | None,
+    run_id: str | None,
+) -> None:
+    deadline = time.monotonic() + seconds
+    while True:
+        raise_if_stop_requested(stop_request, run_id=run_id)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(1.0, remaining))
 
 
 def kubectl_prefix(command_text: str, kubeconfig: Path | None) -> list[str]:
@@ -253,12 +298,15 @@ def wait_for_ray_pods(
     expected_workers: int,
     timeout_seconds: int,
     poll_seconds: float = 5.0,
+    stop_request: Path | None = None,
+    run_id: str | None = None,
 ) -> str:
     deadline = time.monotonic() + timeout_seconds
     previous: tuple[str, ...] | None = None
     selector = f"ray.io/cluster={cluster}"
 
     while time.monotonic() < deadline:
+        raise_if_stop_requested(stop_request, run_id=run_id)
         command = [
             *kubectl,
             "get",
@@ -271,6 +319,7 @@ def wait_for_ray_pods(
             "json",
         ]
         result = run_command(command, timeout=30, print_output=False)
+        raise_if_stop_requested(stop_request, run_id=run_id)
         if result.returncode != 0:
             raise StartError(
                 f"cannot read Ray Pods: {result.stderr.strip() or result.stdout.strip()}"
@@ -313,7 +362,11 @@ def wait_for_ray_pods(
             and all(pod_ready(pod) for pod in [*heads, *workers])
         ):
             return str(heads[0]["metadata"]["name"])
-        time.sleep(poll_seconds)
+        sleep_with_stop_polling(
+            poll_seconds,
+            stop_request=stop_request,
+            run_id=run_id,
+        )
 
     raise StartError(
         f"Ray Pods did not become ready within {timeout_seconds} seconds; "
@@ -368,6 +421,36 @@ def retain_then_delete_failed_cluster(
         )
 
 
+def delete_stopped_cluster(
+    kubectl: Sequence[str],
+    *,
+    namespace: str,
+    cluster: str,
+) -> None:
+    print(
+        "STOP REQUEST CLEANUP: deleting RayCluster "
+        f"{namespace}/{cluster} without failure retention."
+    )
+    result = run_command(
+        [
+            *kubectl,
+            "delete",
+            "raycluster",
+            cluster,
+            "-n",
+            namespace,
+            "--ignore-not-found=true",
+            "--wait=false",
+        ],
+        timeout=60,
+    )
+    if result.returncode != 0:
+        print(
+            "WARNING: stop-request RayCluster cleanup did not complete.",
+            file=sys.stderr,
+        )
+
+
 def start_ray_cluster(
     *,
     manifest: Path,
@@ -381,6 +464,8 @@ def start_ray_cluster(
     timeout_seconds: int,
     failure_retention_seconds: int,
     defer_failure_cleanup: bool = False,
+    stop_request: Path | None = None,
+    run_id: str | None = None,
 ) -> None:
     if not manifest.is_file() or manifest.is_symlink():
         raise StartError(f"manifest is not a regular file: {manifest}")
@@ -388,6 +473,7 @@ def start_ray_cluster(
 
     applied = False
     try:
+        raise_if_stop_requested(stop_request, run_id=run_id)
         print("=== Prepare HCCL/RankTable runtime ===")
         prepare_runtime_configmap(
             kubectl,
@@ -396,6 +482,7 @@ def start_ray_cluster(
             source_dir=runtime_source_dir,
         )
 
+        raise_if_stop_requested(stop_request, run_id=run_id)
         print("=== Apply RayCluster manifest ===")
         result = run_command(
             [*kubectl, "apply", "-f", str(manifest)],
@@ -411,8 +498,11 @@ def start_ray_cluster(
             cluster=cluster,
             expected_workers=expected_workers,
             timeout_seconds=timeout_seconds,
+            stop_request=stop_request,
+            run_id=run_id,
         )
 
+        raise_if_stop_requested(stop_request, run_id=run_id)
         print("=== Ray status ===")
         result = run_command(
             [
@@ -432,6 +522,14 @@ def start_ray_cluster(
         if result.returncode != 0:
             raise StartError("Ray Pods are ready but `ray status` failed")
         print("PASS: Ray head and workers are ready.")
+    except StopRequested:
+        if applied:
+            delete_stopped_cluster(
+                kubectl,
+                namespace=namespace,
+                cluster=cluster,
+            )
+        raise
     except StartError:
         if applied:
             if defer_failure_cleanup:
@@ -458,6 +556,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--cluster", required=True)
     parser.add_argument("--expected-workers", type=int, required=True)
+    parser.add_argument("--run-id")
+    parser.add_argument("--stop-request", type=Path)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument(
         "--failure-retention-seconds",
@@ -479,10 +579,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.expected_workers <= 0
         or args.timeout_seconds <= 0
         or args.failure_retention_seconds < -1
+        or (args.run_id is None) != (args.stop_request is None)
     ):
         print(
             "STOP: expected workers/timeout must be positive and "
-            "failure retention must be -1 or non-negative",
+            "failure retention must be -1 or non-negative, and "
+            "run ID/stop request must be supplied together",
             file=sys.stderr,
         )
         return 1
@@ -502,8 +604,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             failure_retention_seconds=args.failure_retention_seconds,
             defer_failure_cleanup=args.defer_failure_cleanup,
+            stop_request=(
+                args.stop_request.resolve() if args.stop_request is not None else None
+            ),
+            run_id=args.run_id,
         )
         return 0
+    except StopRequested as error:
+        print(f"STOP: {error}; failed-resource retention was skipped.", file=sys.stderr)
+        return 130
     except StartError as error:
         print(f"STOP: Ray cluster startup failed: {error}", file=sys.stderr)
         return 1

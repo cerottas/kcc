@@ -12,12 +12,18 @@ import sys
 from typing import Any, Mapping, Sequence
 
 import yaml
+import cluster_config
 
 
 CLUSTER_TOKEN = "__KCC_RAY_CLUSTER__"
 NAMESPACE_TOKEN = "__KCC_RAY_NAMESPACE__"
 HEAD_NODE_TOKEN = "__KCC_RAY_HEAD_NODE__"
 NPU_RESOURCE_TOKEN = "__KCC_RAY_NPU_RESOURCE__"
+DEVICES_PER_NODE_TOKEN = "__KCC_RAY_DEVICES_PER_NODE__"
+WORKSPACE_HOST_PATH_TOKEN = "__KCC_RAY_WORKSPACE_HOST_PATH__"
+RAY_HEAD_IMAGE_TOKEN = "__KCC_RAY_HEAD_IMAGE__"
+RAY_WORKER_IMAGE_TOKEN = "__KCC_RAY_WORKER_IMAGE__"
+RAY_IMAGE_PULL_POLICY_TOKEN = "__KCC_RAY_IMAGE_PULL_POLICY__"
 
 
 class RenderError(RuntimeError):
@@ -98,6 +104,18 @@ def require_mapping(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def parse_selectors(values: Sequence[str], label: str) -> dict[str, str]:
+    selectors: dict[str, str] = {}
+    for value in values:
+        key, separator, label_value = value.partition("=")
+        if not separator or not key or not label_value:
+            raise RenderError(f"{label} must use KEY=VALUE")
+        if key in selectors:
+            raise RenderError(f"{label} contains duplicate key: {key}")
+        selectors[key] = label_value
+    return selectors
+
+
 def replace_template_tokens(value: Any, replacements: Mapping[str, str]) -> Any:
     """Replace explicit template tokens in values and mapping keys."""
     if isinstance(value, str):
@@ -148,9 +166,30 @@ def render_manifest(
     cluster: str,
     head_node: str,
     npu_resource: str,
+    devices_per_node: int,
+    workspace_host_path: Path,
+    ray_head_image: str,
+    ray_worker_image: str,
+    ray_image_pull_policy: str,
+    runtime_class_name: str | None,
+    head_selector: Mapping[str, str],
+    worker_selector: Mapping[str, str],
     runtime_configmap: str,
     run_id: str,
 ) -> None:
+    if not 1 <= devices_per_node <= 64:
+        raise RenderError("devices per node must be within 1..64")
+    if not workspace_host_path.is_absolute():
+        raise RenderError("workspace host path must be absolute")
+    try:
+        cluster_config.validate_profile_image(ray_head_image, "Ray head image")
+        cluster_config.validate_profile_image(ray_worker_image, "Ray worker image")
+        cluster_config.validate_image_pull_policy(
+            ray_image_pull_policy,
+            "Ray image pull policy",
+        )
+    except cluster_config.ClusterConfigError as error:
+        raise RenderError(str(error)) from error
     if not base_manifest.is_file() or base_manifest.is_symlink():
         raise RenderError(f"base manifest is not a regular file: {base_manifest}")
     try:
@@ -164,6 +203,11 @@ def render_manifest(
         NAMESPACE_TOKEN: namespace,
         HEAD_NODE_TOKEN: head_node,
         NPU_RESOURCE_TOKEN: npu_resource,
+        DEVICES_PER_NODE_TOKEN: str(devices_per_node),
+        WORKSPACE_HOST_PATH_TOKEN: str(workspace_host_path),
+        RAY_HEAD_IMAGE_TOKEN: ray_head_image,
+        RAY_WORKER_IMAGE_TOKEN: ray_worker_image,
+        RAY_IMAGE_PULL_POLICY_TOKEN: ray_image_pull_policy,
     }
     documents = [
         replace_template_tokens(document, replacements) for document in raw_documents
@@ -204,6 +248,38 @@ def render_manifest(
         worker_template.get("spec"),
         "Ray worker Pod spec",
     )
+    if worker_selector:
+        worker_spec["nodeSelector"] = dict(worker_selector)
+    else:
+        worker_spec.pop("nodeSelector", None)
+    if runtime_class_name is None:
+        worker_spec.pop("runtimeClassName", None)
+    else:
+        worker_spec["runtimeClassName"] = runtime_class_name
+    ray_start_params = require_mapping(
+        worker_group.get("rayStartParams"), "Ray worker start parameters"
+    )
+    ray_resources = json.dumps(
+        {"NPU": devices_per_node, "trainctl_worker": 1},
+        separators=(",", ":"),
+    )
+    ray_start_params["resources"] = json.dumps(ray_resources)
+    containers = worker_spec.get("containers")
+    if not isinstance(containers, list):
+        raise RenderError("Ray worker Pod spec has no container list")
+    worker_containers = [
+        container
+        for container in containers
+        if isinstance(container, dict) and container.get("name") == "ray-worker"
+    ]
+    if len(worker_containers) != 1:
+        raise RenderError("Ray worker Pod spec must have one ray-worker container")
+    resources = require_mapping(
+        worker_containers[0].get("resources"), "Ray worker resources"
+    )
+    for field in ("requests", "limits"):
+        quantities = require_mapping(resources.get(field), f"Ray worker {field}")
+        quantities[npu_resource] = str(devices_per_node)
     affinity = require_mapping(worker_spec.get("affinity"), "worker affinity")
     node_affinity = require_mapping(
         affinity.get("nodeAffinity"),
@@ -242,10 +318,9 @@ def render_manifest(
         head_template.get("spec"),
         "Ray head Pod spec",
     )
-    head_selector = require_mapping(
-        head_spec.get("nodeSelector"), "Ray head node selector"
-    )
-    head_selector["kubernetes.io/hostname"] = head_node
+    effective_head_selector = dict(head_selector)
+    effective_head_selector["kubernetes.io/hostname"] = head_node
+    head_spec["nodeSelector"] = effective_head_selector
     update_runtime_configmap(head_spec, runtime_configmap)
 
     if output_manifest.exists() or output_manifest.is_symlink():
@@ -275,6 +350,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cluster", required=True)
     parser.add_argument("--head-node", required=True)
     parser.add_argument("--npu-resource", required=True)
+    parser.add_argument("--devices-per-node", type=int, required=True)
+    parser.add_argument("--workspace-host-path", type=Path, required=True)
+    parser.add_argument("--ray-head-image", required=True)
+    parser.add_argument("--ray-worker-image", required=True)
+    parser.add_argument(
+        "--ray-image-pull-policy",
+        choices=("Always", "IfNotPresent", "Never"),
+        required=True,
+    )
+    parser.add_argument("--runtime-class-name")
+    parser.add_argument("--head-selector", action="append", default=[])
+    parser.add_argument("--worker-selector", action="append", default=[])
     parser.add_argument("--runtime-configmap", required=True)
     parser.add_argument("--run-id", required=True)
     return parser
@@ -296,6 +383,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             cluster=args.cluster,
             head_node=args.head_node,
             npu_resource=args.npu_resource,
+            devices_per_node=args.devices_per_node,
+            workspace_host_path=args.workspace_host_path,
+            ray_head_image=args.ray_head_image,
+            ray_worker_image=args.ray_worker_image,
+            ray_image_pull_policy=args.ray_image_pull_policy,
+            runtime_class_name=args.runtime_class_name,
+            head_selector=parse_selectors(args.head_selector, "head selector"),
+            worker_selector=parse_selectors(args.worker_selector, "worker selector"),
             runtime_configmap=args.runtime_configmap,
             run_id=args.run_id,
         )

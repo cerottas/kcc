@@ -1,0 +1,161 @@
+import json
+from pathlib import Path
+import re
+import tomllib
+import unittest
+
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CHART = ROOT / "deploy/helm/kcc-training-stable"
+
+
+def crd(name: str) -> dict:
+    return yaml.safe_load((CHART / "crds" / name).read_text(encoding="utf-8"))
+
+
+class DistributionTests(unittest.TestCase):
+    def test_release_versions_are_identical(self) -> None:
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        version = project["project"]["version"]
+        chart = yaml.safe_load((CHART / "Chart.yaml").read_text(encoding="utf-8"))
+        module = (ROOT / "src/kcc_training/__init__.py").read_text(encoding="utf-8")
+        self.assertEqual(chart["version"], version)
+        self.assertEqual(chart["appVersion"], version)
+        self.assertRegex(module, rf'__version__\s*=\s*"{re.escape(version)}"')
+
+    def test_only_stable_chart_is_publishable(self) -> None:
+        self.assertFalse(
+            yaml.safe_load((CHART / "Chart.yaml").read_text(encoding="utf-8")).get(
+                "deprecated", False
+            )
+        )
+        legacy = (
+            "kcc-training",
+            "kcc-training-final",
+            "kcc-training-release",
+            "kcc-training-v1",
+            "kcc-training-v2",
+        )
+        for name in legacy:
+            with self.subTest(chart=name):
+                metadata = yaml.safe_load(
+                    (ROOT / "deploy/helm" / name / "Chart.yaml").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertTrue(metadata.get("deprecated"))
+                self.assertIn("DEPRECATED", metadata["description"])
+
+    def test_runtime_profile_crd_matches_supported_portability_fields(self) -> None:
+        schema = crd("trainingruntimeprofiles.yaml")["spec"]["versions"][0]["schema"][
+            "openAPIV3Schema"
+        ]["properties"]["spec"]["properties"]
+        self.assertEqual(
+            schema["integrations"]["properties"]["rankTableProvider"]["enum"],
+            ["clusterd"],
+        )
+        pull_secret = schema["images"]["properties"]["pullSecrets"]["items"]
+        self.assertLessEqual(len("registry.credentials"), pull_secret["maxLength"])
+        self.assertIsNotNone(re.fullmatch(pull_secret["pattern"], "registry.credentials"))
+        for role in ("head", "worker"):
+            quantities = schema["podTemplate"]["properties"][role]["properties"][
+                "resources"
+            ]["properties"]
+            for category in ("requests", "limits"):
+                quantity = quantities[category]["additionalProperties"]
+                self.assertEqual(
+                    {item["type"] for item in quantity["anyOf"]},
+                    {"integer", "string"},
+                )
+                self.assertTrue(quantity["x-kubernetes-int-or-string"])
+
+    def test_training_run_crd_caps_combined_recovery_attempts(self) -> None:
+        validations = crd("trainingruns.yaml")["spec"]["versions"][0]["schema"][
+            "openAPIV3Schema"
+        ]["properties"]["spec"]["x-kubernetes-validations"]
+        self.assertTrue(
+            any(
+                "maxReplacements" in validation["rule"]
+                and "sameTopologyRetries" in validation["rule"]
+                and "<= 100" in validation["rule"]
+                for validation in validations
+            )
+        )
+
+    def test_training_run_contract_exposes_checkpoint_stop_control(self) -> None:
+        schema = crd("trainingruns.yaml")["spec"]["versions"][0]["schema"][
+            "openAPIV3Schema"
+        ]
+        suspend_mode = schema["properties"]["spec"]["properties"][
+            "suspendMode"
+        ]
+        self.assertEqual(
+            suspend_mode["enum"],
+            ["Immediate", "AfterCheckpoint"],
+        )
+        status = schema["properties"]["status"]["properties"]
+        self.assertIn("Stopping", status["phase"]["enum"])
+        self.assertIn("stopRequestGeneration", status)
+        self.assertIn("stopBaselineIteration", status)
+
+    def test_training_run_status_covers_runtime_checkpoint_and_diagnosis(self) -> None:
+        status = crd("trainingruns.yaml")["spec"]["versions"][0]["schema"][
+            "openAPIV3Schema"
+        ]["properties"]["status"]
+        self.assertNotIn("x-kubernetes-preserve-unknown-fields", status)
+        checkpoint = status["properties"]["checkpoint"]["properties"]
+        for name in (
+            "available",
+            "iteration",
+            "snapshotSha256",
+            "hashMode",
+            "sampleBytesPerFile",
+        ):
+            self.assertIn(name, checkpoint)
+        diagnosis = status["properties"]["diagnosis"]["properties"]
+        self.assertIn("reportedFailedNodes", diagnosis)
+
+    def test_training_run_json_contract_exposes_same_checkpoint_fields(self) -> None:
+        contract = json.loads(
+            (ROOT / "contracts/training-run.schema.json").read_text(encoding="utf-8")
+        )
+        checkpoint = contract["$defs"]["checkpoint"]["properties"]
+        self.assertEqual(checkpoint["hashMode"]["const"], "sampled-v1")
+        self.assertIn("sampleBytesPerFile", checkpoint)
+        self.assertIn(
+            "reportedFailedNodes",
+            contract["$defs"]["diagnosis"]["properties"],
+        )
+
+    def test_chart_defaults_use_release_scoped_runtime_sa_and_pdb(self) -> None:
+        values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(values["runtimeServiceAccount"]["name"], "")
+        self.assertTrue(values["controller"]["podDisruptionBudget"]["enabled"])
+        self.assertEqual(
+            values["controller"]["podDisruptionBudget"]["minAvailable"],
+            1,
+        )
+
+    def test_preflight_checks_token_key_and_supports_bundle_chart(self) -> None:
+        script = (ROOT / "scripts/stable-preflight.sh").read_text(encoding="utf-8")
+        self.assertIn('print(f"tokenSecret={token}")', script)
+        self.assertIn('"token" in (json.load(sys.stdin).get("data") or {})', script)
+        self.assertIn("KCC_PREFLIGHT_RENDER_ONLY", script)
+        self.assertIn("kcc-training-*.tgz", script)
+
+    def test_image_workflows_enable_arm64_emulation(self) -> None:
+        workflows = (
+            ROOT / ".github/workflows/ci.yml",
+            ROOT.parent / ".github/workflows/kcc-training.yml",
+        )
+        for workflow in workflows:
+            with self.subTest(workflow=workflow):
+                content = workflow.read_text(encoding="utf-8")
+                self.assertIn("docker/setup-qemu-action@v3", content)
+                self.assertIn("worker_platform", content)
+
+if __name__ == "__main__":
+    unittest.main()
+

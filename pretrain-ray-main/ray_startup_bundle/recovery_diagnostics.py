@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""One-shot, fail-closed node diagnosis for whole-world training recovery.
+"""Fail-closed node diagnosis for whole-world training recovery.
 
 Hardware status and process occupancy are kept separate: occupancy never makes
 a node look broken, but the next world is allowed to start only after every
 survivor and selected spare is idle.  This uses the same Kubernetes/exporter
-signals as the existing environment check.
+signals as the existing environment check.  Single-snapshot diagnosis remains
+available; callers can also require bounded, consecutive confirmation.
 """
 
 from __future__ import annotations
@@ -14,7 +15,8 @@ import json
 from pathlib import Path
 import shlex
 import sys
-from typing import Any, Mapping, Sequence
+import time
+from typing import Any, Callable, Mapping, Sequence
 
 try:
     from . import cluster_config
@@ -265,24 +267,25 @@ def assess_nodes(
             }
         )
         hardware_reasons: list[str] = []
-        if report["capacity"] != expected_npus:
+        if report["capacity"] < expected_npus:
             hardware_reasons.append(
                 f"Kubernetes NPU capacity is {report['capacity']}, "
-                f"expected {expected_npus}"
+                f"requires at least {expected_npus}"
             )
-        if report["allocatable"] != expected_npus:
+        if report["allocatable"] < expected_npus:
             hardware_reasons.append(
                 f"Kubernetes allocatable NPU is {report['allocatable']}, "
-                f"expected {expected_npus}"
+                f"requires at least {expected_npus}"
             )
-        if state["visible"] != expected_npus:
+        if state["visible"] < expected_npus:
             hardware_reasons.append(
-                f"exporter sees {state['visible']} NPU(s), expected {expected_npus}"
+                f"exporter sees {state['visible']} NPU(s), "
+                f"requires at least {expected_npus}"
             )
-        if state["health_samples"] != expected_npus:
+        if state["health_samples"] != state["visible"]:
             hardware_reasons.append(
                 f"exporter has {state['health_samples']} health sample(s), "
-                f"expected {expected_npus}"
+                f"expected {state['visible']} for all visible devices"
             )
         health_ids = [sample["labels"].get("id") for sample in health_samples]
         if any(identifier is None for identifier in health_ids) or len(
@@ -543,6 +546,121 @@ def diagnose_replacement(
     return select_replacement(active, spares)
 
 
+def _failed_nodes(diagnosis: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return a stable node identity tuple from one diagnosis result."""
+
+    raw_nodes = diagnosis.get("failedActiveNodes")
+    if raw_nodes is None:
+        replacements = diagnosis.get("replacements", [])
+        if isinstance(replacements, Sequence) and not isinstance(
+            replacements, (str, bytes)
+        ):
+            raw_nodes = [
+                item.get("failedNode")
+                for item in replacements
+                if isinstance(item, Mapping)
+            ]
+    if not isinstance(raw_nodes, Sequence) or isinstance(raw_nodes, (str, bytes)):
+        return ()
+    return tuple(sorted({str(node) for node in raw_nodes if node is not None}))
+
+
+def diagnose_stable_replacement(
+    diagnose_once: Callable[[], Mapping[str, Any]],
+    *,
+    stable_samples: int,
+    max_samples: int,
+    poll_seconds: float = 0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Confirm a hardware diagnosis using bounded consecutive samples.
+
+    The caller owns the overall time window by choosing ``max_samples`` and
+    ``poll_seconds``.  Only the latest diagnosis is retained.  A sampling
+    exception is converted to an inconclusive sample and resets the streak.
+    """
+
+    if stable_samples < 1:
+        raise ValueError("stable_samples must be at least 1")
+    if max_samples < 1:
+        raise ValueError("max_samples must be at least 1")
+    if poll_seconds < 0:
+        raise ValueError("poll_seconds must not be negative")
+
+    previous_nodes: tuple[str, ...] = ()
+    consecutive = 0
+    latest: dict[str, Any] | None = None
+    last_issue = "diagnosis did not identify a failed active node"
+
+    for sample_count in range(1, max_samples + 1):
+        try:
+            sampled = diagnose_once()
+            if not isinstance(sampled, Mapping):
+                raise TypeError("diagnosis result is not a mapping")
+            latest = dict(sampled)
+            nodes = _failed_nodes(sampled)
+            if nodes and nodes == previous_nodes:
+                consecutive += 1
+            elif nodes:
+                previous_nodes = nodes
+                consecutive = 1
+            else:
+                previous_nodes = ()
+                consecutive = 0
+
+            replacement_allowed = sampled.get(
+                "replacementAllowed", sampled.get("allowReplacement")
+            ) is True
+            restart_ready = sampled.get("restartReady") is True
+            if (
+                nodes
+                and consecutive >= stable_samples
+                and replacement_allowed
+                and restart_ready
+            ):
+                return {
+                    "stable": True,
+                    "sampleCount": sample_count,
+                    "confirmedFailedNodes": list(nodes),
+                    "latestDiagnosis": latest,
+                    "reason": "stable hardware failure confirmed",
+                }
+
+            if not nodes:
+                last_issue = "latest diagnosis did not identify a failed active node"
+            elif not replacement_allowed or not restart_ready:
+                last_issue = "latest diagnosis is not ready for replacement"
+            else:
+                last_issue = (
+                    f"failure was observed for {consecutive} consecutive sample(s); "
+                    f"{stable_samples} required"
+                )
+        except Exception as error:
+            previous_nodes = ()
+            consecutive = 0
+            message = str(error).replace("\n", " ")[:500]
+            last_issue = f"diagnosis sample failed: {message or type(error).__name__}"
+            latest = {
+                "schemaVersion": SCHEMA_VERSION,
+                "outcome": "inconclusive",
+                "replacementAllowed": False,
+                "restartReady": False,
+                "failedActiveNodes": [],
+                "reasons": [last_issue],
+            }
+
+        if sample_count < max_samples and poll_seconds:
+            sleep_fn(poll_seconds)
+
+    return {
+        "stable": False,
+        "sampleCount": max_samples,
+        "confirmedFailedNodes": [],
+        "latestDiagnosis": latest,
+        "reason": last_issue,
+    }
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--active-node", action="append", required=True)
@@ -568,7 +686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             defaults = defaults or cluster_config.load_cluster_config()
         if args.npu_resource is None:
-            args.npu_resource = defaults.npu_check.resource_name
+            args.npu_resource = defaults.accelerator.resource_name
         if args.npu_exporter_app is None:
             args.npu_exporter_app = defaults.npu_check.exporter_app
         if args.npu_exporter_port is None:

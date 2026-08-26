@@ -1,4 +1,4 @@
-schemaVersion: kcc-ray-config/v1
+schemaVersion: kcc-ray-config/v2
 
 # Kubernetes connection and the single RayCluster identity managed by this tool.
 kubernetes:
@@ -20,10 +20,26 @@ topology:
   spareNodes:
     - gpu-server-07
     - gpu-server-08
+  # Additional constraints only. The renderer always pins the exact head and
+  # worker node names selected for the run. Keep these empty when one config
+  # intentionally supports multiple compatible Ascend node models.
+  headSelector: {}
+  workerSelector: {}
+
+# Kubernetes accelerator contract used by both rendering and preflight.
+# devicesPerNode is the Pod request, not the physical device count of a node.
+accelerator:
+  resourceName: huawei.com/Ascend910
+  devicesPerNode: 8
+  runtimeClassName: ascend
+
+images:
+  rayHead: 110.120.0.3:8889/pretrain/ray-head@sha256:121fff1a4b0f991121ba7dc85cbb7a77643d28c79cc355ba3f1536abb51c865b
+  rayWorker: 110.120.0.3:8889/ascendhub/verl_pt27_25rc3@sha256:0c263b4d1989bf41a38f0fe560c60b97b0f4e670f1a4378319dc98117ac4113c
+  pullPolicy: IfNotPresent
 
 # Shared by `check`, startup preflight, and automatic recovery diagnosis.
 npuCheck:
-  resourceName: huawei.com/Ascend910
   exporterNamespace: npu-exporter
   exporterApp: npu-exporter
   exporterPort: 8082
@@ -33,6 +49,7 @@ npuCheck:
 training:
   defaultTemplate: ../ray_startup_bundle/training_templates/pretrain_150M.sh
   workingDirectory: /mnt/models/CODE/MindSpeed-LLM-v2.3.0
+  workspaceHostPath: /mnt/models
 
 # Outer Kubernetes Job settings. Keep the image digest-pinned.
 supervisor:
@@ -52,3 +69,13 @@ timeouts:
   trainingSeconds: 0
   failedResourceRetentionSeconds: 1800
   recoveryCleanupSeconds: 300
+
+# Bounded recovery/watchdog policy. Zero noProgressSeconds disables the
+# progress watchdog; zero diagnosisWindowSeconds keeps one-shot diagnosis.
+recovery:
+  sameTopologyRetries: 2
+  retryBackoffSeconds: 60
+  noProgressSeconds: 3600
+  diagnosisWindowSeconds: 300
+  diagnosisPollSeconds: 30
+  diagnosisStableSamples: 2

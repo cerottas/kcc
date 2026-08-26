@@ -280,8 +280,6 @@ def require_hccn_tool(hccn_tool: str) -> None:
     path = Path(hccn_tool)
     if not path.is_file() or not os.access(path, os.X_OK):
         raise HccnCheckError(f"hccn_tool is missing or not executable: {hccn_tool}")
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        raise HccnCheckError("hccn_tool must run as root")
 
 
 def discover_current_worker(

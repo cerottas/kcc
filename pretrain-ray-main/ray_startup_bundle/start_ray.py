@@ -15,6 +15,7 @@ import time
 from typing import Callable, Sequence
 
 import cluster_config
+import training_control
 
 
 BUNDLE_DIR = Path(__file__).resolve().parent
@@ -33,6 +34,18 @@ Stage = tuple[str, Sequence[str]]
 def new_run_id() -> str:
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"train-{timestamp}-{secrets.token_hex(4)}"
+
+
+def selector_argument(value: str) -> str:
+    key, separator, label_value = value.partition("=")
+    if (
+        not separator
+        or not key
+        or not label_value
+        or any(character.isspace() for character in key + label_value)
+    ):
+        raise argparse.ArgumentTypeError("selector must be KEY=VALUE without whitespace")
+    return value
 
 
 def selected_worker_nodes(args: argparse.Namespace) -> tuple[str, ...]:
@@ -64,8 +77,17 @@ def apply_config_defaults(
         "failure_retention_seconds",
         "train_script",
         "training_cwd",
+        "workspace_host_path",
+        "ray_head_image",
+        "ray_worker_image",
+        "ray_image_pull_policy",
         "training_timeout_seconds",
+        "no_progress_seconds",
         "npu_resource",
+        "devices_per_node",
+        "runtime_class_name",
+        "head_selector",
+        "worker_selector",
         "npu_exporter_namespace",
         "npu_exporter_app",
         "npu_exporter_port",
@@ -101,8 +123,23 @@ def apply_config_defaults(
     )
     fill("train_script", defaults.training.template)
     fill("training_cwd", defaults.training.working_directory)
+    fill("workspace_host_path", defaults.training.workspace_host_path)
+    fill("ray_head_image", defaults.images.ray_head)
+    fill("ray_worker_image", defaults.images.ray_worker)
+    fill("ray_image_pull_policy", defaults.images.pull_policy)
     fill("training_timeout_seconds", defaults.timeouts.training_seconds)
-    fill("npu_resource", defaults.npu_check.resource_name)
+    fill("no_progress_seconds", defaults.recovery.no_progress_seconds)
+    fill("npu_resource", defaults.accelerator.resource_name)
+    fill("devices_per_node", defaults.accelerator.devices_per_node)
+    fill("runtime_class_name", defaults.accelerator.runtime_class_name)
+    fill(
+        "head_selector",
+        [f"{key}={value}" for key, value in defaults.topology.head_selector.items()],
+    )
+    fill(
+        "worker_selector",
+        [f"{key}={value}" for key, value in defaults.topology.worker_selector.items()],
+    )
     fill("npu_exporter_namespace", defaults.npu_check.exporter_namespace)
     fill("npu_exporter_app", defaults.npu_check.exporter_app)
     fill("npu_exporter_port", defaults.npu_check.exporter_port)
@@ -345,6 +382,27 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--workspace-host-path",
+        type=Path,
+        help=(
+            "worker-node host directory mounted at /mnt/models; "
+            "defaults to training.workspaceHostPath"
+        ),
+    )
+    parser.add_argument(
+        "--ray-head-image",
+        help="single-run override for images.rayHead",
+    )
+    parser.add_argument(
+        "--ray-worker-image",
+        help="single-run override for images.rayWorker",
+    )
+    parser.add_argument(
+        "--ray-image-pull-policy",
+        choices=("Always", "IfNotPresent", "Never"),
+        help="single-run override for images.pullPolicy",
+    )
+    parser.add_argument(
         "--training-artifact-root",
         type=Path,
         default=DEFAULT_TRAINING_ARTIFACT_ROOT,
@@ -381,7 +439,36 @@ def make_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--npu-resource", help="single-run override for npuCheck.resourceName"
+        "--no-progress-seconds",
+        type=int,
+        help=(
+            "rank-zero training/checkpoint inactivity timeout; 0 disables it; "
+            "defaults to config/cluster.yaml"
+        ),
+    )
+    parser.add_argument(
+        "--npu-resource", help="single-run override for accelerator.resourceName"
+    )
+    parser.add_argument(
+        "--devices-per-node",
+        type=int,
+        help="single-run override for accelerator.devicesPerNode",
+    )
+    parser.add_argument(
+        "--runtime-class-name",
+        help="single-run override for accelerator.runtimeClassName",
+    )
+    parser.add_argument(
+        "--head-selector",
+        action="append",
+        type=selector_argument,
+        help="replace config head selectors with KEY=VALUE; repeat as needed",
+    )
+    parser.add_argument(
+        "--worker-selector",
+        action="append",
+        type=selector_argument,
+        help="replace config worker selectors with KEY=VALUE; repeat as needed",
     )
     parser.add_argument(
         "--npu-exporter-namespace",
@@ -463,6 +550,8 @@ def build_stage_commands(
             str(args.kubeconfig),
             "--npu-resource",
             args.npu_resource,
+            "--expected-devices-per-node",
+            str(args.devices_per_node),
             "--npu-exporter-app",
             args.npu_exporter_app,
             "--npu-exporter-port",
@@ -489,11 +578,27 @@ def build_stage_commands(
         args.head_node,
         "--npu-resource",
         args.npu_resource,
+        "--devices-per-node",
+        str(args.devices_per_node),
+        "--workspace-host-path",
+        str(args.workspace_host_path),
+        "--ray-head-image",
+        args.ray_head_image,
+        "--ray-worker-image",
+        args.ray_worker_image,
+        "--ray-image-pull-policy",
+        args.ray_image_pull_policy,
         "--runtime-configmap",
         args.runtime_configmap,
         "--run-id",
         run_id,
     ]
+    if args.runtime_class_name is not None:
+        render_command.extend(("--runtime-class-name", args.runtime_class_name))
+    for selector in args.head_selector:
+        render_command.extend(("--head-selector", selector))
+    for selector in args.worker_selector:
+        render_command.extend(("--worker-selector", selector))
     for node in nodes:
         render_command.extend(("--node", node))
 
@@ -520,6 +625,10 @@ def build_stage_commands(
         str(args.timeout_seconds),
         "--failure-retention-seconds",
         str(args.failure_retention_seconds),
+        "--run-id",
+        run_id,
+        "--stop-request",
+        str(training_run_dir / training_control.STOP_REQUEST_FILENAME),
     ]
     hccl_command = [
         sys.executable,
@@ -590,6 +699,8 @@ def build_stage_commands(
         str(result_path),
         "--timeout-seconds",
         str(args.training_timeout_seconds),
+        "--no-progress-seconds",
+        str(args.no_progress_seconds),
         "--failure-retention-seconds",
         str(args.failure_retention_seconds),
     ]
@@ -620,6 +731,15 @@ def validate_args(args: argparse.Namespace, run_id: str) -> None:
         args.supervisor_service_account, "supervisor service account"
     )
     cluster_config.validate_pinned_image(args.supervisor_image, "supervisor image")
+    cluster_config.validate_profile_image(args.ray_head_image, "Ray head image")
+    cluster_config.validate_profile_image(
+        args.ray_worker_image,
+        "Ray worker image",
+    )
+    cluster_config.validate_image_pull_policy(
+        args.ray_image_pull_policy,
+        "Ray image pull policy",
+    )
     for label, value in (
         ("head node", args.head_node),
         ("supervisor node", args.supervisor_node),
@@ -628,6 +748,20 @@ def validate_args(args: argparse.Namespace, run_id: str) -> None:
     ):
         if not value or any(character.isspace() for character in value):
             raise ValueError(f"{label} must be non-empty and whitespace-free")
+    if not 1 <= args.devices_per_node <= 64:
+        raise ValueError("devices per node must be within 1..64")
+    if args.runtime_class_name is not None and (
+        not args.runtime_class_name
+        or any(character.isspace() for character in args.runtime_class_name)
+    ):
+        raise ValueError("runtime class name must be non-empty and whitespace-free")
+    for label, selectors in (
+        ("head selectors", args.head_selector),
+        ("worker selectors", args.worker_selector),
+    ):
+        keys = [selector.partition("=")[0] for selector in selectors]
+        if len(keys) != len(set(keys)):
+            raise ValueError(f"{label} contain duplicate keys")
     if (
         args.timeout_seconds <= 0
         or args.hccl_timeout_seconds <= 0
@@ -667,6 +801,8 @@ def validate_args(args: argparse.Namespace, run_id: str) -> None:
         raise ValueError("failure retention must be -1 or non-negative")
     if args.training_timeout_seconds < 0:
         raise ValueError("training timeout must be zero or positive")
+    if args.no_progress_seconds < 0:
+        raise ValueError("no-progress timeout must be zero or positive")
     if not 1 <= args.npu_exporter_port <= 65535:
         raise ValueError("NPU exporter port must be within 1..65535")
     if args.supervisor_backoff_limit < 0:
@@ -679,6 +815,8 @@ def validate_args(args: argparse.Namespace, run_id: str) -> None:
         raise ValueError("master port must be within 1024..65535")
     if not args.training_cwd.startswith("/"):
         raise ValueError("training cwd must be an absolute worker path")
+    if not args.workspace_host_path.is_absolute():
+        raise ValueError("workspace host path must be absolute")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

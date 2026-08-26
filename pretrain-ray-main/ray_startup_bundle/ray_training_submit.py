@@ -33,6 +33,7 @@ TERMINAL_JOB_STATUSES = frozenset({"SUCCEEDED", "FAILED", "STOPPED"})
 DEFAULT_POLL_SECONDS = 30.0
 DEFAULT_STATUS_RETRY_SECONDS = 300.0
 STATUS_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 30.0)
+DEFAULT_NO_PROGRESS_SECONDS = 3600
 
 
 class SubmitError(RuntimeError):
@@ -819,6 +820,7 @@ def submit(
     failure_retention_seconds: int,
     poll_seconds: float,
     keep_success_resources: bool,
+    no_progress_seconds: int = DEFAULT_NO_PROGRESS_SECONDS,
 ) -> None:
     submission_record_path = result_path.with_name(SUBMISSION_RECORD_FILENAME)
     if result_path.exists() or result_path.is_symlink():
@@ -861,6 +863,8 @@ def submit(
             remote_result,
             "--timeout-seconds",
             str(timeout_seconds),
+            "--no-progress-seconds",
+            str(no_progress_seconds),
         ]
     )
     submission_id = run_id
@@ -965,6 +969,12 @@ def make_parser() -> argparse.ArgumentParser:
         help="per-worker training timeout; 0 means no timeout",
     )
     parser.add_argument(
+        "--no-progress-seconds",
+        type=int,
+        default=DEFAULT_NO_PROGRESS_SECONDS,
+        help="rank-0 no-progress timeout; 0 disables the watchdog",
+    )
+    parser.add_argument(
         "--failure-retention-seconds",
         type=int,
         help="failed training retention; -1 keeps the RayCluster indefinitely",
@@ -991,6 +1001,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if (
             args.timeout_seconds < 0
+            or args.no_progress_seconds < 0
             or args.failure_retention_seconds < -1
             or args.poll_seconds <= 0
         ):
@@ -1023,6 +1034,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cluster=args.cluster,
                 result_path=args.result.resolve(),
                 timeout_seconds=args.timeout_seconds,
+                no_progress_seconds=args.no_progress_seconds,
                 failure_retention_seconds=args.failure_retention_seconds,
                 poll_seconds=args.poll_seconds,
                 keep_success_resources=args.keep_success_resources,

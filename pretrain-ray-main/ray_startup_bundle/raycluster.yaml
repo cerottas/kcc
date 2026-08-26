@@ -116,6 +116,8 @@ spec:
         labels:
           app.kubernetes.io/name: __KCC_RAY_CLUSTER__
           app.kubernetes.io/component: ray-head
+        annotations:
+          huawei.com/skip-ascend-plugin: enabled
       spec:
         serviceAccountName: __KCC_RAY_CLUSTER__-hccl
         automountServiceAccountToken: true
@@ -123,13 +125,12 @@ spec:
           fsGroup: 1000
           fsGroupChangePolicy: OnRootMismatch
         nodeSelector:
-          kubernetes.io/arch: amd64
           kubernetes.io/hostname: __KCC_RAY_HEAD_NODE__
         terminationGracePeriodSeconds: 30
         containers:
           - name: ray-head
-            image: 110.120.0.3:8889/pretrain/ray-head@sha256:121fff1a4b0f991121ba7dc85cbb7a77643d28c79cc355ba3f1536abb51c865b
-            imagePullPolicy: IfNotPresent
+            image: __KCC_RAY_HEAD_IMAGE__
+            imagePullPolicy: __KCC_RAY_IMAGE_PULL_POLICY__
             command: ["/bin/bash", "-lc", "--"]
             args:
               - |
@@ -218,7 +219,7 @@ spec:
       maxReplicas: 2
       rayStartParams:
         num-cpus: "32"
-        resources: '"{\"NPU\":8,\"trainctl_worker\":1}"'
+        resources: '"{\"NPU\":__KCC_RAY_DEVICES_PER_NODE__,\"trainctl_worker\":1}"'
       template:
         metadata:
           labels:
@@ -226,10 +227,6 @@ spec:
             app.kubernetes.io/component: ray-worker
         spec:
           automountServiceAccountToken: false
-          runtimeClassName: ascend
-          nodeSelector:
-            kubernetes.io/arch: arm64
-            node.kubernetes.io/npu.chip.name: 910B3
           affinity:
             nodeAffinity:
               requiredDuringSchedulingIgnoredDuringExecution:
@@ -250,8 +247,8 @@ spec:
           terminationGracePeriodSeconds: 30
           containers:
             - name: ray-worker
-              image: 110.120.0.3:8889/ascendhub/verl_pt27_25rc3@sha256:0c263b4d1989bf41a38f0fe560c60b97b0f4e670f1a4378319dc98117ac4113c
-              imagePullPolicy: IfNotPresent
+              image: __KCC_RAY_WORKER_IMAGE__
+              imagePullPolicy: __KCC_RAY_IMAGE_PULL_POLICY__
               securityContext:
                 privileged: true
               command: ["/bin/bash", "-lc", "--"]
@@ -303,11 +300,11 @@ spec:
                 requests:
                   cpu: "32"
                   memory: 128Gi
-                  __KCC_RAY_NPU_RESOURCE__: "8"
+                  __KCC_RAY_NPU_RESOURCE__: "__KCC_RAY_DEVICES_PER_NODE__"
                 limits:
                   cpu: "128"
                   memory: 512Gi
-                  __KCC_RAY_NPU_RESOURCE__: "8"
+                  __KCC_RAY_NPU_RESOURCE__: "__KCC_RAY_DEVICES_PER_NODE__"
               volumeMounts:
                 - name: runtime-source
                   mountPath: /opt/trainctl-source
@@ -350,7 +347,7 @@ spec:
                     path: hccl.json
             - name: models
               hostPath:
-                path: /mnt/models
+                path: __KCC_RAY_WORKSPACE_HOST_PATH__
                 type: Directory
             - name: ascend-driver
               hostPath:

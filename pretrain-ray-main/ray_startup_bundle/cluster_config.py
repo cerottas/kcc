@@ -17,11 +17,24 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "cluster.yaml"
 CONFIG_ENVIRONMENT_VARIABLE = "KCC_RAY_CONFIG"
-CONFIG_SCHEMA = "kcc-ray-config/v1"
+CONFIG_SCHEMA = "kcc-ray-config/v2"
+PREVIOUS_CONFIG_SCHEMA = "kcc-ray-config/v1"
 LEGACY_CONFIG_SCHEMA = "kcc-ray-cluster/v1"
 CONFIG_MAX_BYTES = 64 * 1024
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 _PINNED_IMAGE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
+_IMAGE_REFERENCE_CHARACTERS = re.compile(r"^[A-Za-z0-9._:/@-]+$")
+_IMAGE_TAG = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+
+DEFAULT_RAY_HEAD_IMAGE = (
+    "110.120.0.3:8889/pretrain/ray-head@sha256:"
+    "121fff1a4b0f991121ba7dc85cbb7a77643d28c79cc355ba3f1536abb51c865b"
+)
+DEFAULT_RAY_WORKER_IMAGE = (
+    "110.120.0.3:8889/ascendhub/verl_pt27_25rc3@sha256:"
+    "0c263b4d1989bf41a38f0fe560c60b97b0f4e670f1a4378319dc98117ac4113c"
+)
+DEFAULT_RAY_IMAGE_PULL_POLICY = "IfNotPresent"
 
 
 class ClusterConfigError(ValueError):
@@ -41,6 +54,8 @@ class TopologyDefaults:
     head_node: str
     active_nodes: tuple[str, ...]
     spare_nodes: tuple[str, ...]
+    head_selector: Mapping[str, str]
+    worker_selector: Mapping[str, str]
 
     @property
     def all_nodes(self) -> tuple[str, ...]:
@@ -49,16 +64,30 @@ class TopologyDefaults:
 
 @dataclass(frozen=True)
 class NpuCheckDefaults:
-    resource_name: str
     exporter_namespace: str
     exporter_app: str
     exporter_port: int
 
 
 @dataclass(frozen=True)
+class AcceleratorDefaults:
+    resource_name: str
+    devices_per_node: int
+    runtime_class_name: str | None
+
+
+@dataclass(frozen=True)
 class TrainingDefaults:
     template: Path
     working_directory: str
+    workspace_host_path: Path
+
+
+@dataclass(frozen=True)
+class ImageDefaults:
+    ray_head: str
+    ray_worker: str
+    pull_policy: str
 
 
 @dataclass(frozen=True)
@@ -82,14 +111,27 @@ class TimeoutDefaults:
 
 
 @dataclass(frozen=True)
+class RecoveryDefaults:
+    same_topology_retries: int
+    retry_backoff_seconds: int
+    no_progress_seconds: int
+    diagnosis_window_seconds: int
+    diagnosis_poll_seconds: int
+    diagnosis_stable_samples: int
+
+
+@dataclass(frozen=True)
 class ClusterConfig:
     path: Path
     kubernetes: KubernetesDefaults
     topology: TopologyDefaults
+    accelerator: AcceleratorDefaults
     npu_check: NpuCheckDefaults
     training: TrainingDefaults
+    images: ImageDefaults
     supervisor: SupervisorDefaults
     timeouts: TimeoutDefaults
+    recovery: RecoveryDefaults
 
     # Compatibility accessors for the first, topology-only configuration.
     @property
@@ -110,8 +152,14 @@ def selected_config_path() -> Path:
     return Path(configured).expanduser() if configured else DEFAULT_CONFIG_PATH
 
 
-def _fail_unknown(document: Mapping[str, Any], expected: set[str], label: str) -> None:
-    unknown = set(document) - expected
+def _fail_unknown(
+    document: Mapping[str, Any],
+    expected: set[str],
+    label: str,
+    *,
+    optional: set[str] | None = None,
+) -> None:
+    unknown = set(document) - expected - (optional or set())
     missing = expected - set(document)
     if unknown:
         raise ClusterConfigError(
@@ -123,6 +171,25 @@ def _fail_unknown(document: Mapping[str, Any], expected: set[str], label: str) -
             f"{label} is missing required keys: "
             + ", ".join(sorted(str(key) for key in missing))
         )
+
+
+def _default_recovery() -> RecoveryDefaults:
+    return RecoveryDefaults(
+        same_topology_retries=2,
+        retry_backoff_seconds=60,
+        no_progress_seconds=3600,
+        diagnosis_window_seconds=300,
+        diagnosis_poll_seconds=30,
+        diagnosis_stable_samples=2,
+    )
+
+
+def _default_images() -> ImageDefaults:
+    return ImageDefaults(
+        ray_head=DEFAULT_RAY_HEAD_IMAGE,
+        ray_worker=DEFAULT_RAY_WORKER_IMAGE,
+        pull_policy=DEFAULT_RAY_IMAGE_PULL_POLICY,
+    )
 
 
 def _mapping(
@@ -162,6 +229,46 @@ def validate_pinned_image(value: Any, label: str) -> str:
     return result
 
 
+def validate_profile_image(value: Any, label: str) -> str:
+    """Require an explicit digest or a non-latest tag for a Ray runtime image."""
+
+    result = _text(value, label, whitespace_free=True)
+    if (
+        _IMAGE_REFERENCE_CHARACTERS.fullmatch(result) is None
+        or result.startswith(("/", "."))
+        or result.endswith(("/", ":", "@"))
+        or "//" in result
+    ):
+        raise ClusterConfigError(
+            f"{label} must be a valid image reference with an explicit tag or digest"
+        )
+    if "@" in result:
+        if result.count("@") != 1 or _PINNED_IMAGE.fullmatch(result) is None:
+            raise ClusterConfigError(
+                f"{label} digest must use @sha256:<64 lowercase hex characters>"
+            )
+        return result
+    leaf = result.rsplit("/", 1)[-1]
+    name, separator, tag = leaf.rpartition(":")
+    if (
+        not separator
+        or not name
+        or _IMAGE_TAG.fullmatch(tag) is None
+        or tag.lower() == "latest"
+    ):
+        raise ClusterConfigError(
+            f"{label} must use an explicit non-latest tag or sha256 digest"
+        )
+    return result
+
+
+def validate_image_pull_policy(value: Any, label: str) -> str:
+    result = _text(value, label, whitespace_free=True)
+    if result not in {"Always", "IfNotPresent", "Never"}:
+        raise ClusterConfigError(f"{label} must be Always, IfNotPresent, or Never")
+    return result
+
+
 def _integer(
     value: Any,
     label: str,
@@ -187,16 +294,30 @@ def _path(value: Any, label: str, *, base: Path) -> Path:
         raise ClusterConfigError(f"cannot resolve {label}: {error}") from error
 
 
-def _node_list(document: Mapping[str, Any], key: str) -> tuple[str, ...]:
+def _node_list(
+    document: Mapping[str, Any], key: str, *, allow_empty: bool = False
+) -> tuple[str, ...]:
     value = document.get(key)
-    if not isinstance(value, list) or not value:
-        raise ClusterConfigError(f"topology.{key} must be a non-empty YAML list")
+    if not isinstance(value, list) or (not value and not allow_empty):
+        qualifier = "a YAML list" if allow_empty else "a non-empty YAML list"
+        raise ClusterConfigError(f"topology.{key} must be {qualifier}")
     nodes = tuple(
         _text(node, f"topology.{key} item", whitespace_free=True) for node in value
     )
     if len(nodes) != len(set(nodes)):
         raise ClusterConfigError(f"topology.{key} contains duplicate node targets")
     return nodes
+
+
+def _string_map(value: Any, label: str) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise ClusterConfigError(f"{label} must be a YAML mapping")
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        parsed_key = _text(key, f"{label} key", whitespace_free=True)
+        parsed_value = _text(item, f"{label}.{parsed_key}", whitespace_free=True)
+        result[parsed_key] = parsed_value
+    return result
 
 
 def _builtin_config(path: Path, active: tuple[str, ...], spare: tuple[str, ...]) -> ClusterConfig:
@@ -213,9 +334,18 @@ def _builtin_config(path: Path, active: tuple[str, ...], spare: tuple[str, ...])
             head_node="server-00",
             active_nodes=active,
             spare_nodes=spare,
+            head_selector={"kubernetes.io/arch": "amd64"},
+            worker_selector={
+                "kubernetes.io/arch": "arm64",
+                "node.kubernetes.io/npu.chip.name": "910B3",
+            },
+        ),
+        accelerator=AcceleratorDefaults(
+            resource_name="huawei.com/Ascend910",
+            devices_per_node=8,
+            runtime_class_name="ascend",
         ),
         npu_check=NpuCheckDefaults(
-            resource_name="huawei.com/Ascend910",
             exporter_namespace="npu-exporter",
             exporter_app="npu-exporter",
             exporter_port=8082,
@@ -226,7 +356,9 @@ def _builtin_config(path: Path, active: tuple[str, ...], spare: tuple[str, ...])
             / "training_templates"
             / "pretrain_150M.sh",
             working_directory="/mnt/models/CODE/MindSpeed-LLM-v2.3.0",
+            workspace_host_path=Path("/mnt/models"),
         ),
+        images=_default_images(),
         supervisor=SupervisorDefaults(
             node="server-00",
             service_account="pretrain-ray-supervisor",
@@ -246,6 +378,7 @@ def _builtin_config(path: Path, active: tuple[str, ...], spare: tuple[str, ...])
             failed_resource_retention_seconds=1800,
             recovery_cleanup_seconds=300,
         ),
+        recovery=_default_recovery(),
     )
 
 
@@ -281,40 +414,67 @@ def load_cluster_config(path: Path | None = None) -> ClusterConfig:
                 "activeNodes and spareNodes overlap: " + ", ".join(overlap)
             )
         return _builtin_config(resolved, active, spare)
-    if schema != CONFIG_SCHEMA:
+    if schema not in {CONFIG_SCHEMA, PREVIOUS_CONFIG_SCHEMA}:
         raise ClusterConfigError(
-            f"configuration schemaVersion must be {CONFIG_SCHEMA}"
+            "configuration schemaVersion must be "
+            f"{CONFIG_SCHEMA} (or the migration-only {PREVIOUS_CONFIG_SCHEMA})"
         )
+    current_schema = schema == CONFIG_SCHEMA
 
+    required_sections = {
+        "schemaVersion",
+        "kubernetes",
+        "topology",
+        "npuCheck",
+        "training",
+        "supervisor",
+        "timeouts",
+    }
+    if current_schema:
+        required_sections.add("accelerator")
+        required_sections.add("images")
     _fail_unknown(
         document,
-        {
-            "schemaVersion",
-            "kubernetes",
-            "topology",
-            "npuCheck",
-            "training",
-            "supervisor",
-            "timeouts",
-        },
+        required_sections,
         "configuration",
+        optional={"recovery"},
     )
     kubernetes = _mapping(
         document,
         "kubernetes",
         {"kubectlCommand", "kubeconfig", "namespace", "clusterName"},
     )
-    topology = _mapping(
-        document, "topology", {"headNode", "activeNodes", "spareNodes"}
-    )
+    topology_keys = {"headNode", "activeNodes", "spareNodes"}
+    if current_schema:
+        topology_keys.update({"headSelector", "workerSelector"})
+    topology = _mapping(document, "topology", topology_keys)
+    accelerator = None
+    if current_schema:
+        accelerator = _mapping(
+            document,
+            "accelerator",
+            {"resourceName", "devicesPerNode", "runtimeClassName"},
+        )
+    npu_check_keys = {"exporterNamespace", "exporterApp", "exporterPort"}
+    if not current_schema:
+        npu_check_keys.add("resourceName")
     npu_check = _mapping(
         document,
         "npuCheck",
-        {"resourceName", "exporterNamespace", "exporterApp", "exporterPort"},
+        npu_check_keys,
     )
-    training = _mapping(
-        document, "training", {"defaultTemplate", "workingDirectory"}
-    )
+    training_keys = {"defaultTemplate", "workingDirectory"}
+    if current_schema:
+        training_keys.add("workspaceHostPath")
+    training = _mapping(document, "training", training_keys)
+    images = None
+    if current_schema:
+        images = _mapping(
+            document,
+            "images",
+            {"rayHead", "rayWorker", "pullPolicy"},
+        )
+
     supervisor = _mapping(
         document,
         "supervisor",
@@ -339,6 +499,20 @@ def load_cluster_config(path: Path | None = None) -> ClusterConfig:
             "recoveryCleanupSeconds",
         },
     )
+    recovery = None
+    if "recovery" in document:
+        recovery = _mapping(
+            document,
+            "recovery",
+            {
+                "sameTopologyRetries",
+                "retryBackoffSeconds",
+                "noProgressSeconds",
+                "diagnosisWindowSeconds",
+                "diagnosisPollSeconds",
+                "diagnosisStableSamples",
+            },
+        )
 
     kubectl_command = _text(kubernetes["kubectlCommand"], "kubernetes.kubectlCommand")
     try:
@@ -351,7 +525,27 @@ def load_cluster_config(path: Path | None = None) -> ClusterConfig:
     namespace = _dns_label(kubernetes["namespace"], "kubernetes.namespace")
     cluster_name = _dns_label(kubernetes["clusterName"], "kubernetes.clusterName")
     active_nodes = _node_list(topology, "activeNodes")
-    spare_nodes = _node_list(topology, "spareNodes")
+    spare_nodes = _node_list(topology, "spareNodes", allow_empty=current_schema)
+    if current_schema:
+        head_selector = _string_map(
+            topology["headSelector"], "topology.headSelector"
+        )
+        worker_selector = _string_map(
+            topology["workerSelector"], "topology.workerSelector"
+        )
+    else:
+        # The v1 shape described the original 8-card 910B3 installation.
+        # Keep that behavior only while old configs are migrated to v2.
+        head_selector = {"kubernetes.io/arch": "amd64"}
+        worker_selector = {
+            "kubernetes.io/arch": "arm64",
+            "node.kubernetes.io/npu.chip.name": "910B3",
+        }
+        accelerator = {
+            "resourceName": npu_check["resourceName"],
+            "devicesPerNode": 8,
+            "runtimeClassName": "ascend",
+        }
     overlap = sorted(set(active_nodes) & set(spare_nodes))
     if overlap:
         raise ClusterConfigError(
@@ -362,6 +556,24 @@ def load_cluster_config(path: Path | None = None) -> ClusterConfig:
     worker_cwd = _text(training["workingDirectory"], "training.workingDirectory")
     if not worker_cwd.startswith("/"):
         raise ClusterConfigError("training.workingDirectory must be absolute")
+    if current_schema:
+        workspace_host_path = Path(
+            _text(training["workspaceHostPath"], "training.workspaceHostPath")
+        )
+        if not workspace_host_path.is_absolute():
+            raise ClusterConfigError("training.workspaceHostPath must be absolute")
+        image_defaults = ImageDefaults(
+            ray_head=validate_profile_image(images["rayHead"], "images.rayHead"),
+            ray_worker=validate_profile_image(
+                images["rayWorker"], "images.rayWorker"
+            ),
+            pull_policy=validate_image_pull_policy(
+                images["pullPolicy"], "images.pullPolicy"
+            ),
+        )
+    else:
+        workspace_host_path = Path("/mnt/models")
+        image_defaults = _default_images()
     image = validate_pinned_image(supervisor["image"], "supervisor.image")
     pull_policy = _text(
         supervisor["imagePullPolicy"], "supervisor.imagePullPolicy"
@@ -369,6 +581,41 @@ def load_cluster_config(path: Path | None = None) -> ClusterConfig:
     if pull_policy not in {"Always", "IfNotPresent", "Never"}:
         raise ClusterConfigError(
             "supervisor.imagePullPolicy must be Always, IfNotPresent, or Never"
+        )
+
+    recovery_defaults = _default_recovery()
+    if recovery is not None:
+        recovery_defaults = RecoveryDefaults(
+            same_topology_retries=_integer(
+                recovery["sameTopologyRetries"],
+                "recovery.sameTopologyRetries",
+                minimum=0,
+            ),
+            retry_backoff_seconds=_integer(
+                recovery["retryBackoffSeconds"],
+                "recovery.retryBackoffSeconds",
+                minimum=0,
+            ),
+            no_progress_seconds=_integer(
+                recovery["noProgressSeconds"],
+                "recovery.noProgressSeconds",
+                minimum=0,
+            ),
+            diagnosis_window_seconds=_integer(
+                recovery["diagnosisWindowSeconds"],
+                "recovery.diagnosisWindowSeconds",
+                minimum=0,
+            ),
+            diagnosis_poll_seconds=_integer(
+                recovery["diagnosisPollSeconds"],
+                "recovery.diagnosisPollSeconds",
+                minimum=1,
+            ),
+            diagnosis_stable_samples=_integer(
+                recovery["diagnosisStableSamples"],
+                "recovery.diagnosisStableSamples",
+                minimum=1,
+            ),
         )
 
     return ClusterConfig(
@@ -389,13 +636,31 @@ def load_cluster_config(path: Path | None = None) -> ClusterConfig:
             ),
             active_nodes=active_nodes,
             spare_nodes=spare_nodes,
+            head_selector=head_selector,
+            worker_selector=worker_selector,
         ),
-        npu_check=NpuCheckDefaults(
+        accelerator=AcceleratorDefaults(
             resource_name=_text(
-                npu_check["resourceName"],
-                "npuCheck.resourceName",
+                accelerator["resourceName"],
+                "accelerator.resourceName",
                 whitespace_free=True,
             ),
+            devices_per_node=_integer(
+                accelerator["devicesPerNode"],
+                "accelerator.devicesPerNode",
+                minimum=1,
+                maximum=64,
+            ),
+            runtime_class_name=(
+                _dns_label(
+                    accelerator["runtimeClassName"],
+                    "accelerator.runtimeClassName",
+                )
+                if accelerator["runtimeClassName"] is not None
+                else None
+            ),
+        ),
+        npu_check=NpuCheckDefaults(
             exporter_namespace=_dns_label(
                 npu_check["exporterNamespace"], "npuCheck.exporterNamespace"
             ),
@@ -418,7 +683,9 @@ def load_cluster_config(path: Path | None = None) -> ClusterConfig:
                 base=resolved.parent,
             ),
             working_directory=worker_cwd,
+            workspace_host_path=workspace_host_path,
         ),
+        images=image_defaults,
         supervisor=SupervisorDefaults(
             node=_text(
                 supervisor["node"], "supervisor.node", whitespace_free=True
@@ -472,6 +739,7 @@ def load_cluster_config(path: Path | None = None) -> ClusterConfig:
                 minimum=1,
             ),
         ),
+        recovery=recovery_defaults,
     )
 
 

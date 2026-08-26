@@ -1,255 +1,164 @@
-# KCC Ray 内部预训练工具
+# KCC Training
 
-`kcc_ray` 是当前 K3s + KubeRay + Ascend 集群的内部预训练入口。它负责节点检查、
-RayCluster 创建、HCCL 验证、Ray Job 提交、checkpoint 续训、备用机恢复和安全停止。
+KCC Training 是面向 Kubernetes、KubeRay 和 Ascend NPU 的分布式训练控制面。平台只需提交
+三个 `training.kcc.io/v1beta1` 资源，控制器负责创建 RayCluster、执行 HCCL gate、管理恢复
+attempt，并将输出发布为不可变 `artifact://` 制品。
 
-本目录是运行工具，不是通用 Kubernetes 发行版。默认节点、私有镜像、Ascend 资源、
-`/mnt/models` 挂载和训练路径均针对现有内部集群。
+当前源码和分发面统一为 **1.1.0**。唯一受支持的发布入口是：
 
-## 目录
+- Helm Chart：`deploy/helm/kcc-training-stable`
+- Controller：`python -m kcc_training.controller_stable`
+- Runtime coordinator：`python -m kcc_training.runtime.coordinator_stable`
+- API：`training.kcc.io/v1beta1`
+- 示例：`examples/*.yaml`
 
-```text
-bin/kcc_ray                       统一命令入口
-config/cluster.yaml              集群和运行默认值
-ray_startup_bundle/              Ray/HCCL/恢复实现
-  raycluster.yaml                Ray Pod 镜像、资源和挂载
-  training_templates/
-    pretrain_150M.sh             默认训练模板
-requirements.txt                 控制端 Python 依赖
-log/                             本机运行状态，安装时创建，不参与分发
-```
+`bin/kcc_ray`、`ray_startup_bundle/` 的旧编排入口及其他同名 Chart 只用于迁移审计和紧急
+回滚，不会进入 stable bundle，也不应由新集成调用。
 
-模型、数据、checkpoint 和训练日志位于各 Worker 共同可见的 `/mnt/models`，不在
-软件包中。
+源码既可保留为当前 monorepo 的 `pretrain-ray-main/` 组件，也可将该目录独立抽取为
+GitHub 仓库；根 workflow 与本目录 workflow 使用同一 stable 门禁。
 
-## 集群前提
-
-安装前确认现有集群已经具备：
-
-- `server-00` 可运行 `/usr/local/bin/k3s kubectl`，并有可用 kubeconfig；
-- KubeRay Operator、Volcano、Ascend runtime/device plugin 和 `npu-exporter` 正常；
-- head/worker/Supervisor 私有镜像可拉取；
-- Worker 上 `/mnt/models` 是所有训练节点看到内容一致的共享存储；
-- Worker 上存在 CANN/NNAL、8 张 Ascend NPU，以及模板需要的数据、tokenizer、
-  checkpoint 和训练源码；
-- `training.workingDirectory` 中存在常规文件 `pretrain_gpt.py`；
-- 操作者拥有创建 Namespace、RBAC、Job、RayCluster 和 ConfigMap 的权限。
-
-当前镜像和路径还要求 Python 3.10、Ray 2.49.0、
-`/root/miniconda3/envs/ms/bin/torchrun`、`make/g++` 和 CANN 头文件。它们已经包含在
-现有内部镜像中。
-
-## 安装
-
-推荐只在 `config/cluster.yaml` 的 `supervisor.node`（当前为 `server-00`）安装和
-执行命令。Supervisor Pod 会通过 `hostPath` 挂载软件的真实绝对路径，因此安装目录
-必须位于该宿主机，并且运行期间不能移动或删除。
-
-从共同项目的已审核 tag 安装到固定目录：
-
-```bash
-sudo git clone --branch <已审核-tag> --depth 1 \
-  https://github.com/zzzYesYes/kcc.git /opt/kcc
-
-# Supervisor 当前以 UID/GID 1001 写入持久状态。
-sudo install -d -o 1001 -g 1001 -m 0770 \
-  /opt/kcc/pretrain-ray-main/log
-
-cd /opt/kcc/pretrain-ray-main
-python3 -m pip install --user -r requirements.txt
-python3 -c 'import yaml; print(yaml.__version__)'
-
-sudo ln -sfn /opt/kcc/pretrain-ray-main/bin/kcc_ray /usr/local/bin/kcc_ray
-readlink -f /usr/local/bin/kcc_ray
-kcc_ray --help
-```
-
-`bin/kcc_ray` 使用操作者当前的 `python3`，所以 PyYAML 必须安装到这个 Python
-能够读取的位置。不要只在另一个未激活的虚拟环境中安装依赖。
-
-如果使用内部 tar 包或其他安装目录，替换上述路径即可，但安装目录必须保持固定，并
-满足相同的 Supervisor hostPath 和 `log/` 写权限要求。
-
-## 首次配置
-
-先修改 [`config/cluster.yaml`](config/cluster.yaml)：
-
-- `kubernetes`：kubectl、kubeconfig、namespace 和唯一 RayCluster 名；
-- `topology`：head、默认训练节点和按顺序使用的备用节点；
-- `npuCheck`：Ascend 资源名和 exporter 地址；
-- `training.defaultTemplate`：默认训练模板；
-- `training.workingDirectory`：每个 Worker 容器内的训练源码目录；
-- `supervisor`：外层 Kubernetes Job 的节点、ServiceAccount、镜像和重试策略；
-- `timeouts`：Ray、HCCL、训练、资源保留和恢复清理超时。
-
-显式命令参数只覆盖本次调用。也可以通过
-`KCC_RAY_CONFIG=/path/to/cluster.yaml` 选择另一份完整配置；如果外置配置使用相对
-`defaultTemplate`，路径相对该 YAML 文件解析，建议改为安装目录下的绝对路径。
-
-训练内容分别维护在两个地方：
-
-- [`training_templates/pretrain_150M.sh`](ray_startup_bundle/training_templates/pretrain_150M.sh)：
-  模型参数、数据/tokenizer、checkpoint、batch size、学习率、训练步数和保存间隔；
-- [`raycluster.yaml`](ray_startup_bundle/raycluster.yaml)：head/worker 镜像、CPU/内存/NPU、
-  runtimeClass 和 hostPath 挂载。
-
-`training.workingDirectory` 不是另一份训练模板。实际执行关系是：
+## 运行模型
 
 ```text
-pretrain_150M.sh（参数和启动命令）
-  -> cd /mnt/models/CODE/MindSpeed-LLM-v2.3.0
-  -> torchrun ... pretrain_gpt.py ...
+Material / GitOps
+  -> TrainingRuntimeProfile（集群能力和不可变运行环境）
+  -> TrainingRecipe（结构化命令和 artifact 引用）
+  -> TrainingRun（规模、暂停和恢复预算）
+  -> KCC Controller
+  -> KubeRay -> HCCL gate -> torch distributed training
+  -> checkpoint + immutable output Artifact
 ```
 
-默认模板当前关闭 W&B。需要启用时通过集群 Secret 或运行环境提供凭据，不要把 API
-key 写入仓库或训练模板。
+Recipe 和 RuntimeProfile 的 `spec` 不可原地修改；发布新版本时使用新资源名。
+TrainingRun 创建后仅 `spec.suspend` 和 `spec.suspendMode` 可修改。这使重放、审计和
+GitOps diff 保持确定；`Immediate` 为兼容默认值，`AfterCheckpoint` 会等待请求后的下一个
+多 Worker 一致 checkpoint。
 
-## 部署前检查
+## 外部依赖
+
+KCC 不打包集群基础设施。目标环境必须提供：
+
+- Kubernetes 及 `ray.io/v1` KubeRay Operator；
+- Ascend device plugin、与镜像匹配的驱动/CANN/HCCL，以及可选 RuntimeClass；
+- ClusterD RankTable 集成；1.0 仅支持 `rankTableProvider: clusterd`；
+- 所有 Ray Pod 可读写的 RWX PVC；
+- 实现 `docs/release/artifact-gateway.md` 的 Artifact Gateway；
+- 可按 digest 拉取 controller/head/worker 镜像的 OCI Registry。
+
+`healthProvider: kubernetes` 不依赖 npu-exporter，但只支持调度/节点状态观察，必须设置
+`maxReplacements: 0`。需要自动设备诊断和 N-for-N 换机时，使用
+`healthProvider: npu-exporter`，并在 Helm values 中启用 `npuExporter.enabled`。
+
+完整责任边界见 [依赖说明](docs/release/dependencies.md)。
+
+## 本地检查
+
+需要 Python 3.10+、Helm 3 和 PyYAML：
 
 ```bash
-# 默认检查 activeNodes + spareNodes，不创建 Ray 资源。
-kcc_ray check
-
-# 只检查指定节点。
-kcc_ray check --node gpu-server-00 --node gpu-server-07
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+make check
 ```
 
-只有检查通过后再启动正式任务。
+`make check` 执行单元测试、编译、v1beta1 合同验证、stable Helm 多配置渲染、wheel
+安装检查和脚本静态检查；它不会连接集群或构建 CANN 镜像。
 
-## 启动训练
+## 构建镜像
 
-普通 `start` 默认从模板中的 checkpoint 续训，并启用配置中的备用机自动恢复。
-建议显式记录 `run-id`：
+所有基础镜像必须固定 digest。显式选择目标架构：
 
 ```bash
-kcc_ray start --run-id pretrain-150m-001
+scripts/build-images.sh registry.example/kcc 1.1.0 \
+  python-base@sha256:... ray-head-base@sha256:... \
+  ascend-worker-base@sha256:... kubectl@sha256:... \
+  linux/amd64 linux/arm64
 ```
 
-不传 `--run-id` 时会自动生成；请保存命令输出中的 ID。`start` 创建 Kubernetes
-Supervisor Job 后立即返回，后续训练不依赖当前终端。
+脚本只在本地加载镜像。推送后使用 registry 返回的 digest 更新 Helm values 和
+RuntimeProfile。镜像兼容组合必须记录在
+[兼容矩阵](docs/compatibility-matrix.md)并通过目标集群验收。
 
-常用变体：
+## 安装与首次任务
+
+复制 stable values，替换 controller digest、Artifact Gateway、Secret 和目标集群调度配置：
 
 ```bash
-# 从 iteration 0 开始；使用单次前台流程。
-kcc_ray start --fresh --run-id pretrain-150m-fresh-001
-
-# activeNodes + spareNodes 全部参加训练，不保留备用机。
-kcc_ray start --all-nodes --run-id pretrain-150m-all-001
-
-# 临时指定训练节点和备用节点。
-kcc_ray start \
-  --run-id pretrain-150m-custom-001 \
-  --node gpu-server-00 \
-  --node gpu-server-01 \
-  --spare-node gpu-server-07
-
-# 选择安装目录内的另一份训练模板。
-kcc_ray start \
-  --run-id pretrain-150m-template-001 \
-  --train-script /opt/kcc/pretrain-ray-main/ray_startup_bundle/training_templates/custom.sh
+cp deploy/helm/kcc-training-stable/values.yaml values-prod.yaml
+helm upgrade --install kcc deploy/helm/kcc-training-stable \
+  --namespace kcc-training --create-namespace \
+  --values values-prod.yaml
 ```
 
-显式 `--node` 或 `--all-nodes` 会自动允许本次拓扑与模板原始 `NNODES` 不同。
-checkpoint 是否支持该 world size 仍由提交者负责确认。
-
-## 查询和恢复连接
+将 `examples/runtime-profile.yaml` 中的镜像、节点、PVC、资源名和 RuntimeClass 改为目标
+环境值。安装后执行只读预检：
 
 ```bash
-kcc_ray status --run-id pretrain-150m-001
-kcc_ray logs --run-id pretrain-150m-001
-kcc_ray logs --run-id pretrain-150m-001 --supervisor
+scripts/stable-preflight.sh \
+  values-prod.yaml kcc-training kcc examples/runtime-profile.yaml
 ```
 
-Supervisor Pod 重启时会自动续接已有状态和原 Ray Job，不会重复提交。只有需要手工
-重新接入同一个逻辑任务时才使用：
+随后按顺序提交资源：
 
 ```bash
-kcc_ray start --resume --run-id pretrain-150m-001
+kubectl apply -f examples/runtime-profile.yaml
+kubectl apply -f examples/recipe.yaml
+kubectl apply -f examples/training-run.yaml
+kubectl -n kcc-training get trainingruns -w
 ```
 
-手工续接的参数必须与首次启动一致。每个逻辑任务首次启动时会把训练模板快照保存到
-`log/training-jobs/<run-id>/`；之后修改源模板不会改变该任务或它的备用机恢复轮次。
+示例包含占位 digest 和节点名，不能原样用于生产。
 
-## 停止
+## Material 集成边界
+
+Material 只需要：
+
+1. 引用管理员维护的 RuntimeProfile；
+2. 创建版本化 Recipe；
+3. 通过平台 TrainingRequest API 提交、停止和恢复训练，由 Crossplane 创建 TrainingRun；
+4. 读取映射后的 `phase/attempt/conditions/checkpoint/outputArtifact`；需要安全停点时
+   选择 `AfterCheckpoint`，并展示 `Stopping` 阶段。
+
+Material 不应直接创建 TrainingRun，也不应创建或删除 RayCluster、attempt ConfigMap、
+Lease；不得向 KCC 传递宿主机路径、kubeconfig、SSH 凭据或 shell 字符串。可复制的
+TrainingRun JSON Schema 位于 `contracts/`，完整平台映射与实施门禁见
+[Material/Crossplane 集成计划](docs/release/material-crossplane-integration-plan.md)。
+
+## 离线分发
+
+镜像已按 digest 推送并拉取到构建机后：
 
 ```bash
-# 立即停止，保留 checkpoint。
-kcc_ray stop --run-id pretrain-150m-001
-
-# 等所有 Worker 一致看到下一次已提交 checkpoint 后停止。
-kcc_ray stop-after-checkpoint --run-id pretrain-150m-001
-
-# 直接停止当前 Ray Job 并清理其 RayCluster，作为控制/维护入口。
-kcc_ray cancel --run-id pretrain-150m-001
+scripts/build-stable-bundle.sh ./kcc-training-1.1.0 1.1.0 \
+  registry/controller@sha256:... \
+  registry/head@sha256:... \
+  registry/worker@sha256:...
 ```
 
-`stop-after-checkpoint` 在前台等待；按 `Ctrl-C` 只取消等待，不停止训练。停止标记会
-阻止 Supervisor 把人工停止误判为故障并启用备用机。这些命令不会删除 checkpoint。
+bundle 包含镜像归档、完整 Python wheel 依赖、stable Chart、contracts、示例、可编辑
+values、镜像锁、安装/预检脚本、文档和 `SHA256SUMS`。使用前编辑 values，再运行：
 
-## 自动恢复边界
+```bash
+kcc-training-1.1.0/scripts/install-stable.sh \
+  ./kcc-training-1.1.0 kcc-training kcc ./values-prod.yaml
+```
 
-正式训练阶段失败后，Supervisor 会先清理旧 RayCluster，再检查 checkpoint 和节点。
-只有同时满足以下条件才会消耗备用机并创建下一轮 `a01/a02`：
+详细操作、切流与回滚见 [STABLE.md](STABLE.md) 和
+[发布手册](docs/release/README.md)。
 
-- 所有 Worker 看到同一个已提交 checkpoint；
-- 能明确诊断出不健康的 active 节点；
-- 其余 active 节点已经空闲；
-- 有数量足够、健康且空闲的备用节点；
-- 没有收到人工停止请求，且未超过备用机预算。
-
-网络瞬断或 Ray Actor 断联本身不等于整机故障。诊断不明确时会进入
-`MANUAL_REQUIRED`，不会盲目换机。
-
-## 状态和日志
-
-控制状态位于安装目录：
+## 仓库结构
 
 ```text
-log/hccl-startup/<attempt-id>/
-log/training-runs/<attempt-id>/
-log/training-jobs/<run-id>/state.json
+src/kcc_training/                    控制器、运行时和外部适配器
+deploy/helm/kcc-training-stable/     唯一发布 Chart 与 v1beta1 CRD
+contracts/                           Material 可消费的 JSON Schema
+examples/                            canonical v1beta1 示例
+docker/                              controller/head/worker 镜像
+scripts/                             构建、审计、预检和离线安装
+tests/                               单元及发布语义测试
+ray_startup_bundle/                  迁移期 HCCL 实现与 legacy 回滚材料
 ```
 
-Worker 训练日志和 fresh 归档位于共享存储：
-
-```text
-/mnt/models/pretrain-ray-platform/log/<attempt-id>/
-/mnt/models/pretrain-ray-platform/archive/<run-id>/
-```
-
-`log/` 包含集群拓扑、注入脚本和恢复状态，是运行数据而不是软件源码。分发包和 Git
-提交必须排除 `log/**`、`state.json`、`__pycache__/`、测试归档和历史报告。
-
-## 升级与卸载
-
-长任务运行期间不要覆盖、移动或删除安装目录。Supervisor Pod 重启时仍会从该
-hostPath 读取控制代码。升级前先停止全部任务，并备份 `log/`：
-
-```bash
-kcc_ray stop-after-checkpoint --run-id <run-id>
-sudo cp -a /opt/kcc/pretrain-ray-main/log /opt/kcc-ray-log-backup
-```
-
-确认没有 Supervisor Job 或 RayCluster 后再替换代码，并恢复 `log/` 所有者为
-`1001:1001`。卸载软件不会自动删除 `/mnt/models` 中的 checkpoint 和训练日志；
-如需删除这些数据，必须单独人工确认目标路径。
-
-## 内部分发清单
-
-发行包只应包含：
-
-```text
-README.md
-requirements.txt
-bin/
-config/
-ray_startup_bundle/
-```
-
-仓库根目录的 `LICENSE` 也必须随源码发行。不要直接打包开发工作目录；应从经过审核
-的 Git commit/tag 生成发行包，避免把被 `.gitignore` 忽略但仍存在于磁盘的运行状态
-带进去。
-
-实现细节、证据格式和故障恢复状态机见
-[`ray_startup_bundle/README.md`](ray_startup_bundle/README.md)。
+本仓库使用 Apache-2.0 许可证。源码通过 CI 和静态发布审计不等于目标集群验收完成；上线前
+仍需按兼容矩阵完成真实 HCCL、短训练、checkpoint 恢复和故障演练。

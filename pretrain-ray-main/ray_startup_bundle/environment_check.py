@@ -118,6 +118,7 @@ def check_kubernetes_npu_occupancy(
     pods_document: Mapping[str, Any],
     targets: Sequence[str],
     resource_name: str = DEFAULT_NPU_RESOURCE,
+    expected_devices_per_node: int | None = None,
 ) -> dict[str, Any]:
     """Module 1: read node information and stop on active NPU ownership."""
 
@@ -177,7 +178,12 @@ def check_kubernetes_npu_occupancy(
         )
         if not ready:
             blocked_reasons.append(f"node is not Ready: {name}")
-        if allocatable <= 0:
+        if expected_devices_per_node is not None and allocatable < expected_devices_per_node:
+            blocked_reasons.append(
+                f"node has {allocatable} allocatable {resource_name}, "
+                f"but the runtime profile requests {expected_devices_per_node}: {name}"
+            )
+        elif allocatable <= 0:
             blocked_reasons.append(f"node has no allocatable NPU: {name}")
 
     owners: list[dict[str, Any]] = []
@@ -463,6 +469,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--kubeconfig", type=Path)
     parser.add_argument("--npu-resource")
+    parser.add_argument("--expected-devices-per-node", type=int)
     parser.add_argument("--npu-exporter-app")
     parser.add_argument("--npu-exporter-port", type=int)
     return parser
@@ -474,6 +481,7 @@ def apply_config_defaults(args: argparse.Namespace) -> None:
         and args.kubectl_command is not None
         and args.kubeconfig is not None
         and args.npu_resource is not None
+        and args.expected_devices_per_node is not None
         and args.npu_exporter_app is not None
         and args.npu_exporter_port is not None
     ):
@@ -486,7 +494,9 @@ def apply_config_defaults(args: argparse.Namespace) -> None:
     if args.kubeconfig is None:
         args.kubeconfig = defaults.kubernetes.kubeconfig
     if args.npu_resource is None:
-        args.npu_resource = defaults.npu_check.resource_name
+        args.npu_resource = defaults.accelerator.resource_name
+    if args.expected_devices_per_node is None:
+        args.expected_devices_per_node = defaults.accelerator.devices_per_node
     if args.npu_exporter_app is None:
         args.npu_exporter_app = defaults.npu_check.exporter_app
     if args.npu_exporter_port is None:
@@ -499,6 +509,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         apply_config_defaults(args)
         if not 1 <= args.npu_exporter_port <= 65535:
             raise CheckError("NPU exporter port must be within 1..65535")
+        if not 1 <= args.expected_devices_per_node <= 64:
+            raise CheckError("expected devices per node must be within 1..64")
         command = shlex.split(args.kubectl_command)
         if not command:
             raise CheckError("kubectl command is empty")
@@ -511,6 +523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pods,
             targets,
             args.npu_resource,
+            args.expected_devices_per_node,
         )
         print_occupancy_result(result)
         inspect_single_node = single_node and len(result["nodes"]) == 1
