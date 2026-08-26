@@ -1,6 +1,6 @@
 # Backstage / Crossplane / KCC 架构集成计划（Material 仓库）
 
-> 状态：待实施基线
+> 状态：控制面 GitOps staging 已形成，待发布配置 Git 并由 Argo 手动同步
 >
 > 形成日期：2026-08-25
 >
@@ -46,9 +46,8 @@ TrainingRequest；Material 只是保存静态配置、部署清单和集成记�
 服务。Crossplane 不直接创建 RayCluster，KCC 不处理租户、审批和配额，KubeRay 不理解训练
 checkpoint 或故障换机。
 
-本方案复用现有 KubeRay Operator，禁止部署第二套 KubeRay。生产中是否已安装、实际
-版本和 Ready 状态必须在阶段 0 用正确 K3s 上下文重新取证，不能以旧 Kind POC 或准备好
-的 YAML 代替生产证据。
+现有 KubeRay Operator 1.6.0 已在生产确认 Ready；本方案只复用它，不部署第二套 KubeRay，
+也不接管其 Helm release。
 
 ## 2. 对原架构图的修正
 
@@ -70,38 +69,42 @@ checkpoint 或故障换机。
 
 ## 3. 已知生产基线和前置缺口
 
-截至 Material 的 2026-08-11 生产记录：
+截至 2026-08-26 的生产只读证据：
 
-- 目标是 `server-00` K3s `v1.34.6+k3s1`；裸 `kubectl`/`helm` 会误指向旧 Kind POC。
-- Crossplane Core 2.3.4 与 RBAC Manager 已 Ready；已有 namespaced ModelDeployment
-  XRD，但没有 Provider、Function、Composition 或 XR。
-- Argo CD 已 Ready，但当前 AppProject 只允许一个隔离 ConfigMap；自动同步、prune 和
-  self-heal 均关闭。
-- Gitea、Tekton、Artifact Keeper 已部署；Backstage 未部署。
-- Artifact Keeper 的生产制品入口与内部 Registry 是不同责任面。运行镜像使用
-  `110.120.0.3:8889` 并固定 digest；Artifact Keeper 当前内网入口是
-  `http://110.120.0.3:30670`。
-- 当前 `110.120.0.3:8889` 实测仅提供 HTTP；K3s 运行镜像可继续使用它，但 Crossplane
-  package manager 需要内部 HTTPS registry（或同一 registry 的 TLS 入口）来拉 Function。
-- 生产资料尚不能证明 KCC、所需 KubeRay CRD、RWX checkpoint PVC、ClusterD RankTable
-  接口或训练用 Artifact Gateway 已通过目标集群验收。
+- 目标是 `server-00` K3s `v1.34.6+k3s1`；生产写入仍必须使用
+  `sudo k3s kubectl`，Helm 必须显式指定 K3s kubeconfig。
+- Crossplane 2.3.4、provider-kubernetes 和 shared `function-patch-and-transform` 均 Healthy；
+  Function 已由现有平台管理，本集成只引用其固定内部 package digest。
+- 现有三个 ModelDeployment Composition 已使用同一个 Function；训练新增独立
+  TrainingRequest XRD，不改变推理 API。
+- Backstage 已部署；它是未来训练前端/API 入口，Material 只是仓库名。
+- KubeRay 1.6.0 已由 Helm 管理并 Ready；KCC 不部署第二套 Operator。
+- Argo CD 现有 control-plane AppProject/Application 保持人工同步，无 automated、prune 或
+  self-heal；训练接入复用并扩展该项目。
+- 集群尚无 KCC CRD、KCC controller、TrainingRequest 或 TrainingRun，因此当前没有对象或
+  字段所有权冲突。
+- KCC 1.1.0 源码已形成本地 Git 提交，controller AMD64 镜像已推送并固定 digest；该提交
+  尚未发布到已确认所有权的远端。
+- Artifact Gateway 兼容层、head/worker digest、RWX checkpoint、ClusterD/npu-exporter
+  训练合同仍未完成；这些不阻塞零实例控制面，但阻塞首次 TrainingRequest。
 
-因此这是原平台上的增量接入，不是重建平台，也不与尚未 Offered 的 ModelDeployment
-推理 API 合并。训练使用独立 TrainingRequest XRD。
+这是原平台上的增量接入，不重建 Crossplane、KubeRay、Backstage、Artifact Keeper 或 Argo。
 
 ## 4. 三个对象边界
 
-以下是控制器所有权边界，不要求新建 AppProject、NetworkPolicy 或准入控制器：
+以下是控制器所有权边界，不新建独立 AppProject、NetworkPolicy 或准入控制器：
 
-| 对象边界 | 管理对象 | 不得管理 |
-|---|---|---|
-| `kcc-control-plane` | stable CRD、KCC Controller、SA/RBAC、values | TrainingRun、RayCluster、PVC 数据、Secret 值、KubeRay Operator |
-| `training-platform-api` | TrainingRequest XRD、Composition、固定 digest 的 Composition Function、TrainingRun namespaced RBAC | TrainingRequest 实例、RayCluster、Pod、KCC 内部 ConfigMap |
-| `training-catalog` | 不可变 TrainingRuntimeProfile、TrainingRecipe | TrainingRun、用户请求、运行状态 |
+| 对象边界 | 唯一静态管理者 | 管理对象 | 不得管理 |
+|---|---|---|---|
+| `kcc-control-plane` | Argo CD | stable CRD、KCC Controller、SA/RBAC、production values | TrainingRun 实例、KubeRay release、PVC 数据、Secret 值 |
+| `training-platform-api` | Argo CD | TrainingRequest XRD、Composition、TrainingRun namespaced RBAC | shared Function、TrainingRequest 实例、RayCluster、Pod、KCC ConfigMap |
+| `training-catalog` | Argo CD | 不可变 TrainingRuntimeProfile、TrainingRecipe | TrainingRun、用户请求、运行状态 |
 
-对象应用顺序固定为：KCC CRD/Controller -> Composition Function/RBAC -> XRD/Composition ->
-Profile/Recipe。可直接应用受审文件，也可复用现有人工同步链路；生产命令必须使用
-`sudo k3s kubectl`，Helm 必须显式使用 `--kubeconfig /etc/rancher/k3s/k3s.yaml`。
+现有 `model-platform-control-plane` AppProject 只做最小增量授权，新的
+`model-platform-training-system` Application 同时渲染 stable Chart 和 API 清单。
+AppProject/Application 本身沿用 server-00 管理员 bootstrap；Application 内静态资源只由
+Argo 写入，不再直接执行 Helm 或 kubectl apply。shared Function 和现有 KubeRay 只作为外部
+依赖验证，不由本集成安装、升级或删除。
 
 ## 5. 资源所有权
 
@@ -297,49 +300,52 @@ checkpoint 首期必须使用真实 RWX 存储。Artifact Keeper 的本地模型
 TrainingRequest 不删除 RWX checkpoint、output artifact、Profile 或 Recipe；数据保留与
 销毁继续使用独立策略。
 
-回滚控制面时：停止新建 TrainingRequest，保留现有 CR/PVC/artifact；回退
-CompositionRevision 或 KCC Helm revision。任何时刻只能有 stable controller 写
-`training.kcc.io/v1beta1`，不得同时启用 legacy 与 stable 两套 writer。
+回滚控制面时：停止新建 TrainingRequest，保留现有 CR/PVC/artifact；回退 Argo source commit
+或 production values 中的 controller digest。静态资源只有 Argo 一个 writer，任何时刻也只允许
+一个 stable controller 写 `training.kcc.io/v1beta1`。
 
 ## 11. 分阶段实施
 
-阶段就绪检查按消费关系拆分：阶段 1 只要求 controller/Gateway，阶段 2 只要求
-Composition Function，head/worker、RWX 和 NPU 依赖留到阶段 3/4，不反向阻塞控制面。
+控制面与运行时分开冻结：Argo 可以先安装 KCC CRD/controller 和 TrainingRequest API，
+但在 runtime lock 关闭期间不创建 Profile、Recipe、TrainingRequest、TrainingRun 或 NPU workload。
 
-### 阶段 0：只读预检与版本冻结
+### 阶段 0：生产只读取证与版本冻结（已完成控制面部分）
 
-- 用生产 K3s 上下文确认 Crossplane 2.3.4、KubeRay CRD/Operator、ClusterD、Ascend
-  Device Plugin、npu-exporter、StorageClass/PVC 和节点架构。
-- 确认 KCC controller/head 是 AMD64，Ascend worker 是 ARM64；镜像全部复制到
-  `110.120.0.3:8889` 并固定平台 child manifest digest。
-- 选择 Crossplane Composition Function，将 AMD64 child 镜像到内部 HTTPS registry，记录
-  上游 index/child 和内部 digest。
-- 验证 Artifact Gateway 与 Artifact Keeper 的 source/model/data/output 四种操作。
-- 记录实际 namespace、ServiceAccount 和首次 NPU canary 的可用节点；不预设 ResourceQuota、
-  NetworkPolicy 或额外准入策略。
+- 已确认 K3s v1.34.6、Crossplane 2.3.4、shared Patch and Transform Function Healthy、
+  KubeRay 1.6.0、Backstage 和现有手动 Argo 应用；
+- 已确认生产尚无 KCC CRD/controller、TrainingRequest、TrainingRun 和 RayCluster；
+- KCC 1.1.0 stable audit 通过，源码提交固定为
+  `5c1187c76a9cc15903c0eaae02554c739ba3886a`；
+- AMD64 controller 已推送内部 Registry，并固定 digest
+  `sha256:77f7c73a9f24f71eb2239bf2b559e1d30e2fb2b940b436ddb4a92881ffbd1542`；
+- Artifact Gateway 使用保留 DNS，服务实现、head/worker、RWX 和 NPU 证据继续留在 runtime TODO。
 
-验收：形成版本锁、关键依赖记录和 0 个新训练实例的预检结果。
+验收：控制面输入已锁定；runtime lock 仍关闭；0 个训练实例。
 
-### 阶段 1：KCC 控制面，不创建 TrainingRun
+### 阶段 1：发布 GitOps 源并创建 Argo Application
 
-- 本地通过 KCC stable audit、Helm lint/template 和 CRD schema 验证。
-- 使用本目录受审文件直接安装或由现有人工同步链路安装 KCC 1.1.0 stable Chart；不要求
-  新增隔离 AppProject。
-- 只验证 CRD Established、controller Ready、RBAC、镜像 digest 和日志。
-- 确认没有第二个 KubeRay Operator，没有 RayCluster、PVC 或 NPU request 被创建。
+- 将 `training/gitops/repository/environments/production/training-system` 提交到生产
+  `model-platform-config.git` 的同名路径；
+- 在 server-00 应用现有 `model-platform-control-plane` AppProject 的增量清单和
+  `model-platform-training-system` Application；
+- Application 同时渲染 KCC stable Chart 和 TrainingRequest XRD/Composition/RBAC，
+  保持 manual sync、prune=false、self-heal=false；
+- shared `function-patch-and-transform` 只验证 Healthy 和锁定 digest，不安装、不升级、
+  不删除；现有 KubeRay release 同样只复用；
+- repository 下的静态对象不再使用直接 Helm 或 kubectl apply。
 
-验收：KCC 控制面 Ready，其他平台组件无回归，TrainingRun 数量为 0。
+验收：Argo diff 只包含预期静态对象，操作员手动同步后 KCC controller Ready、XRD
+Established/Offered、Function Healthy，TrainingRequest/TrainingRun/RayCluster 均为 0。
 
-### 阶段 2：TrainingRequest API 和无实例渲染
+### 阶段 2：无实例合同与所有权验证
 
-- 从内部 HTTPS registry 安装固定 AMD64 digest 的 Composition Function；私有 CA 复用
-  Crossplane 的 CA bundle 配置。
-- 应用 TrainingRun namespaced RBAC、TrainingRequest XRD 和 Pipeline-mode Composition。
-- 使用 `crossplane render`/离线输入覆盖 Running、Immediate Stop、AfterCheckpoint Stop、
-  status 回写和非法预算；不创建真实 XR。
-- 确认 Composition 只能渲染一个同 namespace TrainingRun。
+- 运行合同、manifest、Helm lint/template 和 production-ready kcc/api 检查；
+- 验证 Crossplane 只能管理 TrainingRun metadata/spec，KCC 只写 TrainingRun.status 并管理
+  RayCluster/KCC ConfigMap/Lease，KubeRay 只管理 RayCluster.status 和派生 Pod/Service；
+- 使用离线输入覆盖 Running、Immediate Stop、AfterCheckpoint Stop、status 回写和非法预算；
+- 不创建真实 TrainingRequest 或 TrainingRun。
 
-验收：XRD Established/Offered，Function Healthy，渲染和 schema 测试通过，XR 数量为 0。
+验收：静态 API 链路成立且无字段所有权冲突，训练实例仍为 0。
 
 ### 阶段 3：catalog 与 Suspended smoke
 
@@ -421,15 +427,14 @@ Composition Function，head/worker、RWX 和 NPU 依赖留到阶段 3/4，不反
 
 以下任一项未完成时，不开放生产自服务 Running：
 
-1. KubeRay/ClusterD/Ascend/npu-exporter 的生产版本和 Ready 证据缺失；
-2. controller/head/worker 镜像和 Function package 未按目标架构固定 digest，或 Function
-   package 尚无 Crossplane 可访问的内部 HTTPS 地址；
-3. 没有经过多 Worker 验证的 RWX checkpoint PVC；
-4. Artifact Gateway 尚未覆盖读取、校验、发布和最小权限 Secret；
-5. Crossplane Function、TrainingRun RBAC、Composition 无离线渲染和 0-XR 验证；
-6. AfterCheckpoint、恢复和 N-for-N 未做目标集群演练；
-7. TrainingRequest 状态映射、停止与恢复接口未完成目标集群验证；
-8. 首次 NPU canary 的可用节点和回滚方式尚未确认。
+1. KCC source commit 尚未发布到经确认的远端，training-system staging 尚未提交生产 Gitea；
+2. 现有 AppProject 增量和 training-system Application 尚未由 server-00 管理员应用并手动同步；
+3. head AMD64、worker ARM64 镜像和目标运行时兼容矩阵尚未固定；
+4. ClusterD RankTable、npu-exporter、ARM64 节点和 RWX checkpoint PVC 尚未完成训练侧取证；
+5. 保留的 Artifact Gateway DNS 尚无实现，resolve/download/upload v1 合同尚未 round-trip；
+6. Profile/Recipe、Suspended smoke、HCCL/RankTable canary 尚未执行；
+7. AfterCheckpoint、恢复和 N-for-N 尚未在目标集群演练；
+8. Backstage TrainingRequest 插件、状态映射和首次 NPU canary 回滚尚未完成。
 
 ## 14. 参考
 
