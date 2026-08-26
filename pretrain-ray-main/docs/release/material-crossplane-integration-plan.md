@@ -84,7 +84,7 @@ checkpoint 或故障换机。
 - 集群尚无 KCC CRD、KCC controller、TrainingRequest 或 TrainingRun，因此当前没有对象或
   字段所有权冲突。
 - KCC 1.1.0 源码已形成本地 Git 提交，controller AMD64 镜像已推送并固定 digest；该提交
-  尚未发布到已确认所有权的远端。
+  尚未发布到内部 `gitadmin/kcc` 仓库。
 - Artifact Gateway 兼容层、head/worker digest、RWX checkpoint、ClusterD/npu-exporter
   训练合同仍未完成；这些不阻塞零实例控制面，但阻塞首次 TrainingRequest。
 
@@ -427,7 +427,7 @@ Established/Offered、Function Healthy，TrainingRequest/TrainingRun/RayCluster 
 
 以下任一项未完成时，不开放生产自服务 Running：
 
-1. KCC source commit 尚未发布到经确认的远端，training-system staging 尚未提交生产 Gitea；
+1. KCC v1.1.0 tag 尚未发布到内部 `gitadmin/kcc`，training-system staging 尚未提交生产 Gitea；
 2. 现有 AppProject 增量和 training-system Application 尚未由 server-00 管理员应用并手动同步；
 3. head AMD64、worker ARM64 镜像和目标运行时兼容矩阵尚未固定；
 4. ClusterD RankTable、npu-exporter、ARM64 节点和 RWX checkpoint PVC 尚未完成训练侧取证；
