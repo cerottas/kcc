@@ -7,7 +7,7 @@ metadata:
   labels:
     {{- include "kcc.labels" . | nindent 4 }}
 spec:
-  minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable | quote }}
+  minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable | toJson }}
   selector:
     matchLabels:
       app.kubernetes.io/name: kcc-training

@@ -185,6 +185,15 @@ class DistributionTests(unittest.TestCase):
             1,
         )
 
+        template = (CHART / "templates/poddisruptionbudget.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "minAvailable: "
+            "{{ .Values.controller.podDisruptionBudget.minAvailable | toJson }}",
+            template,
+        )
+
     def test_preflight_checks_token_key_and_supports_bundle_chart(self) -> None:
         script = (ROOT / "scripts/stable-preflight.sh").read_text(encoding="utf-8")
         self.assertIn('print(f"tokenSecret={token}")', script)
