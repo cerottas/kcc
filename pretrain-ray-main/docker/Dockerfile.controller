@@ -9,6 +9,7 @@ WORKDIR /build
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 RUN python -m pip wheel \
+      --no-deps \
       --no-cache-dir \
       --no-build-isolation \
       --wheel-dir /opt/wheels \
