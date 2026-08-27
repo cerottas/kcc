@@ -129,6 +129,53 @@ class DistributionTests(unittest.TestCase):
             contract["$defs"]["diagnosis"]["properties"],
         )
 
+    def test_crd_schemas_use_kubernetes_structural_collections(self) -> None:
+        def walk(value: object, path: str = "$"):
+            if isinstance(value, dict):
+                yield path, value
+                for key, child in value.items():
+                    yield from walk(child, f"{path}.{key}")
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    yield from walk(child, f"{path}[{index}]")
+
+        for name in (
+            "trainingrecipes.yaml",
+            "trainingruns.yaml",
+            "trainingruntimeprofiles.yaml",
+        ):
+            schema = crd(name)["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
+            for path, node in walk(schema):
+                self.assertFalse(
+                    "properties" in node and "additionalProperties" in node,
+                    f"{name}:{path} mixes properties and additionalProperties",
+                )
+                self.assertNotEqual(
+                    node.get("uniqueItems"),
+                    True,
+                    f"{name}:{path} uses quadratic uniqueItems",
+                )
+
+        profile = crd("trainingruntimeprofiles.yaml")["spec"]["versions"][0][
+            "schema"
+        ]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+        collections = {
+            "pullSecrets": profile["images"]["properties"]["pullSecrets"],
+            "activeNodes": profile["scheduling"]["properties"]["activeNodes"],
+            "spareNodes": profile["scheduling"]["properties"]["spareNodes"],
+        }
+        for name, collection in collections.items():
+            self.assertEqual(
+                collection.get("x-kubernetes-list-type"),
+                "set",
+                name,
+            )
+        self.assertEqual(collections["activeNodes"]["maxItems"], 1024)
+        self.assertEqual(collections["spareNodes"]["maxItems"], 100)
+        for collection in collections.values():
+            self.assertEqual(collection["items"]["maxLength"], 253)
+
+
     def test_chart_defaults_use_release_scoped_runtime_sa_and_pdb(self) -> None:
         values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
         self.assertEqual(values["runtimeServiceAccount"]["name"], "")

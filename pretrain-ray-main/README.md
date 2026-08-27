@@ -4,7 +4,7 @@ KCC Training 是面向 Kubernetes、KubeRay 和 Ascend NPU 的分布式训练控
 三个 `training.kcc.io/v1beta1` 资源，控制器负责创建 RayCluster、执行 HCCL gate、管理恢复
 attempt，并将输出发布为不可变 `artifact://` 制品。
 
-当前源码和分发面统一为 **1.1.0**。唯一受支持的发布入口是：
+当前源码和分发面统一为 **1.1.1**。唯一受支持的发布入口是：
 
 - Helm Chart：`deploy/helm/kcc-training-stable`
 - Controller：`python -m kcc_training.controller_stable`
@@ -70,7 +70,7 @@ make check
 所有基础镜像必须固定 digest。显式选择目标架构：
 
 ```bash
-scripts/build-images.sh registry.example/kcc 1.1.0 \
+scripts/build-images.sh registry.example/kcc 1.1.1 \
   python-base@sha256:... ray-head-base@sha256:... \
   ascend-worker-base@sha256:... kubectl@sha256:... \
   linux/amd64 linux/arm64
@@ -130,7 +130,7 @@ TrainingRun JSON Schema 位于 `contracts/`，完整平台映射与实施门禁�
 镜像已按 digest 推送并拉取到构建机后：
 
 ```bash
-scripts/build-stable-bundle.sh ./kcc-training-1.1.0 1.1.0 \
+scripts/build-stable-bundle.sh ./kcc-training-1.1.1 1.1.1 \
   registry/controller@sha256:... \
   registry/head@sha256:... \
   registry/worker@sha256:...
@@ -140,8 +140,8 @@ bundle 包含镜像归档、完整 Python wheel 依赖、stable Chart、contract
 values、镜像锁、安装/预检脚本、文档和 `SHA256SUMS`。使用前编辑 values，再运行：
 
 ```bash
-kcc-training-1.1.0/scripts/install-stable.sh \
-  ./kcc-training-1.1.0 kcc-training kcc ./values-prod.yaml
+kcc-training-1.1.1/scripts/install-stable.sh \
+  ./kcc-training-1.1.1 kcc-training kcc ./values-prod.yaml
 ```
 
 详细操作、切流与回滚见 [STABLE.md](STABLE.md) 和

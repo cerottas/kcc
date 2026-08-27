@@ -28,7 +28,6 @@ spec:
           properties:
             spec:
               type: object
-              additionalProperties: false
               required: [runtimeProfile, recipe, workers, recovery]
               x-kubernetes-validations:
                 - rule: >-
@@ -58,7 +57,6 @@ spec:
                   default: Immediate
                 recovery:
                   type: object
-                  additionalProperties: false
                   required: [sameTopologyRetries, maxReplacements, noProgressSeconds]
                   properties:
                     sameTopologyRetries: {type: integer, minimum: 0, maximum: 10}
@@ -66,7 +64,6 @@ spec:
                     noProgressSeconds: {type: integer, minimum: 0}
             status:
               type: object
-              additionalProperties: false
               properties:
                 phase:
                   type: string
@@ -100,7 +97,6 @@ spec:
                 checkpoint:
                   type: object
                   nullable: true
-                  additionalProperties: false
                   properties:
                     available: {type: boolean}
                     iteration: {type: integer, minimum: 1}
@@ -113,7 +109,6 @@ spec:
                     sampleBytesPerFile: {type: integer, minimum: 1}
                 diagnosis:
                   type: object
-                  additionalProperties: false
                   properties:
                     reportedFailedNodes:
                       type: array
@@ -130,7 +125,6 @@ spec:
                   type: array
                   items:
                     type: object
-                    additionalProperties: false
                     required: [type, status, reason, message, lastTransitionTime]
                     properties:
                       type: {type: string, minLength: 1}
