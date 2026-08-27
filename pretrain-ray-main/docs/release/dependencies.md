@@ -35,6 +35,20 @@ Artifact Gateway 必须在返回成功前持久化内容和 manifest，并对相
 - worker CANN 路径可通过构建环境变量 `CANN_ASCEND_DIR` 指定；
 - control/head 与 worker 可分别构建为 amd64 和 arm64。
 
+当发布机与 worker 架构不同且没有注册 `binfmt` 模拟器时，不要在发布机执行 ARM64
+Dockerfile 的 `RUN`。使用真实 ARM64 节点编译 Python 包和 HCCL 探针，再由发布机只做
+镜像组装：
+
+```bash
+KCC_KUBECTL="sudo /usr/local/bin/k3s kubectl" \
+  scripts/build-worker-image-on-cluster.sh \
+  REGISTRY VERSION WORKER_BASE@sha256:DIGEST ARM64_NODE [NAMESPACE]
+```
+
+脚本创建一个不申请 NPU 的临时 Pod，验证节点架构、CANN/HCCL 动态链接和 Ray/KCC
+导入，复制编译产物后使用 `Dockerfile.worker-prebuilt` 组装本地镜像，并自动删除临时
+Pod 和本地目录。它只依赖仓库、Docker、kubectl 和目标集群，不依赖交互式 AI 会话。
+
 
 worker 运行身份不要求固定为 root，但必须能执行 `hccn_tool` 并访问分配给 Pod 的 Ascend
 设备。目标平台可通过用户组、capabilities 或安全策略提供权限，并以预检和 HCCL canary
