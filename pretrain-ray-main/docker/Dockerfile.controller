@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE} AS builder
+USER root
 
 ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
@@ -14,6 +15,7 @@ RUN python -m pip wheel \
       .
 
 FROM ${BASE_IMAGE}
+USER root
 ARG VERSION=1.0.0
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="kcc-training-controller" \

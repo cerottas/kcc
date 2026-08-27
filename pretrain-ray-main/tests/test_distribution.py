@@ -213,6 +213,13 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("KCC_PREFLIGHT_RENDER_ONLY", script)
         self.assertIn("kcc-training-*.tgz", script)
 
+    def test_image_dockerfiles_can_build_from_non_root_bases(self) -> None:
+        for name in ("controller", "head", "worker"):
+            dockerfile = (ROOT / "docker" / f"Dockerfile.{name}").read_text(encoding="utf-8")
+            self.assertIn("USER root", dockerfile, name)
+        controller = (ROOT / "docker" / "Dockerfile.controller").read_text(encoding="utf-8")
+        self.assertIn("USER 65532:65532", controller)
+
     def test_image_workflows_enable_arm64_emulation(self) -> None:
         workflows = (
             ROOT / ".github/workflows/ci.yml",
