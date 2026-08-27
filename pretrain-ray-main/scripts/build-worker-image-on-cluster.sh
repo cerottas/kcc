@@ -150,8 +150,8 @@ PYTHONPATH=/tmp/kcc-build/out/site-packages python -c \
   "import kcc_training, ray; print(f\"worker artifacts: kcc={kcc_training.__version__} ray={ray.__version__}\")"
 '
 
-"${kubectl_command[@]}" -n "$namespace" cp \
-  "$pod:/tmp/kcc-build/out/." "$temporary"
+"${kubectl_command[@]}" -n "$namespace" exec "$pod" -- \
+  tar -cf - -C /tmp/kcc-build/out . | tar -xf - -C "$temporary"
 
 docker buildx build --load --pull --platform linux/arm64 \
   --build-arg "BASE_IMAGE=$worker_base" \
