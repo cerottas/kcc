@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.7
 ARG KUBECTL_IMAGE
+ARG KUBECTL_SOURCE=/bin/kubectl
 ARG BASE_IMAGE
 FROM ${KUBECTL_IMAGE} AS kubectl
 FROM ${BASE_IMAGE}
@@ -12,7 +13,7 @@ LABEL org.opencontainers.image.title="kcc-training-head" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /opt/kcc
-COPY --from=kubectl /bin/kubectl /usr/local/bin/kubectl
+COPY --from=kubectl ${KUBECTL_SOURCE} /usr/local/bin/kubectl
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY ray_startup_bundle/hccl_runtime/hccl_check /opt/kcc-hccl/hccl_check

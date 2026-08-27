@@ -23,6 +23,7 @@ kubectl_image=$6
 control_platform=${7:-${CONTROL_PLATFORM:-${PLATFORM:-linux/amd64}}}
 worker_platform=${8:-${WORKER_PLATFORM:-${PLATFORM:-$control_platform}}}
 cann_ascend_dir=${CANN_ASCEND_DIR:-/usr/local/Ascend/cann/ascend-toolkit/latest}
+kubectl_source=${KUBECTL_SOURCE:-/bin/kubectl}
 
 if [[ -n ${VCS_REF:-} ]]; then
   vcs_ref=$VCS_REF
@@ -72,6 +73,7 @@ docker buildx build --load --pull --platform "$control_platform" \
 docker buildx build --load --pull --platform "$control_platform" \
   --build-arg "BASE_IMAGE=$head_base" \
   --build-arg "KUBECTL_IMAGE=$kubectl_image" \
+  --build-arg "KUBECTL_SOURCE=$kubectl_source" \
   --build-arg "VERSION=$version" \
   --build-arg "VCS_REF=$vcs_ref" \
   --tag "$registry/kcc-training-head:$version" \
