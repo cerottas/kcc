@@ -201,6 +201,7 @@ class TrainingRuntimeProfile:
     workspace_mount_path: str
     active_nodes: tuple[str, ...]
     spare_nodes: tuple[str, ...]
+    physical_device_ids: tuple[int, ...] = ()
 
     @classmethod
     def load(cls, path: Path) -> "TrainingRuntimeProfile":
@@ -221,10 +222,33 @@ class TrainingRuntimeProfile:
             accelerator,
             {"resourceName", "devicesPerNode"},
             "spec.accelerator",
-            optional={"runtimeClassName"},
+            optional={"runtimeClassName", "physicalDeviceIDs"},
         )
         if accelerator.get("runtimeClassName") is not None:
             _name(accelerator["runtimeClassName"], "spec.accelerator.runtimeClassName")
+        devices_per_node = _integer(
+            accelerator["devicesPerNode"],
+            "spec.accelerator.devicesPerNode",
+            maximum=64,
+        )
+        raw_physical_device_ids = accelerator.get("physicalDeviceIDs", [])
+        if not isinstance(raw_physical_device_ids, list) or any(
+            isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 63
+            for item in raw_physical_device_ids
+        ):
+            raise ContractError("physicalDeviceIDs must contain integers from 0 to 63")
+        physical_device_ids = tuple(raw_physical_device_ids)
+        if len(physical_device_ids) != len(set(physical_device_ids)):
+            raise ContractError("physicalDeviceIDs must be unique")
+        if physical_device_ids and len(physical_device_ids) != devices_per_node:
+            raise ContractError("physicalDeviceIDs must match devicesPerNode")
+        accelerator_resource = _text(
+            accelerator["resourceName"], "spec.accelerator.resourceName"
+        )
+        if physical_device_ids and accelerator_resource != "huawei.com/Ascend910":
+            raise ContractError(
+                "physicalDeviceIDs currently requires resourceName huawei.com/Ascend910"
+            )
         integrations = _mapping(spec["integrations"], "spec.integrations")
         _exact_keys(integrations, {"rankTableProvider", "healthProvider"}, "spec.integrations")
         rank_provider = _text(integrations["rankTableProvider"], "rankTableProvider")
@@ -262,20 +286,15 @@ class TrainingRuntimeProfile:
             head_image=_image(images["head"], "spec.images.head"),
             worker_image=_image(images["worker"], "spec.images.worker"),
             ray_version=_text(spec["rayVersion"], "spec.rayVersion"),
-            accelerator_resource=_text(
-                accelerator["resourceName"], "spec.accelerator.resourceName"
-            ),
-            devices_per_node=_integer(
-                accelerator["devicesPerNode"],
-                "spec.accelerator.devicesPerNode",
-                maximum=64,
-            ),
+            accelerator_resource=accelerator_resource,
+            devices_per_node=devices_per_node,
             rank_table_provider=rank_provider,
             health_provider=health_provider,
             workspace_claim=_name(workspace["claimName"], "spec.workspace.claimName"),
             workspace_mount_path=mount_path,
             active_nodes=active,
             spare_nodes=spare,
+            physical_device_ids=physical_device_ids,
         )
 
 

@@ -115,6 +115,37 @@ class RayClusterTests(unittest.TestCase):
         )
         self.assertEqual(match_labels["training.kcc.io/role"], "worker")
 
+    def test_worker_uses_explicit_ascend_physical_devices(self) -> None:
+        run, profile, recipe = objects()
+        profile = replace(
+            profile,
+            devices_per_node=2,
+            physical_device_ids=(0, 1),
+        )
+        _configmap, cluster = render_attempt(
+            run,
+            profile,
+            recipe,
+            attempt=0,
+            active_nodes=("node-a", "node-b"),
+            runtime_service_account="runtime",
+        )
+        worker = cluster["spec"]["workerGroupSpecs"][0]["template"]
+        self.assertEqual(
+            worker["metadata"]["annotations"]["huawei.com/Ascend910"],
+            "Ascend910-0,Ascend910-1",
+        )
+        environment = {
+            item["name"]: item.get("value")
+            for item in worker["spec"]["containers"][0]["env"]
+        }
+        self.assertEqual(environment["ASCEND_VISIBLE_DEVICES"], "0,1")
+        self.assertEqual(environment["ASCEND_RT_VISIBLE_DEVICES"], "0,1")
+        self.assertEqual(
+            environment["RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES"],
+            "1",
+        )
+
     def test_nodes_outside_admin_profile_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside"):
             render_attempt(*objects(), attempt=0, active_nodes=("node-a", "rogue"), runtime_service_account="runtime")

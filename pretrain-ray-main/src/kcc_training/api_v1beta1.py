@@ -175,6 +175,7 @@ class RuntimeProfile:
     worker_priority_class_name: str | None
     head_ray_cpus: int
     worker_ray_cpus: int
+    physical_device_ids: tuple[int, ...] = ()
 
     @classmethod
     def from_resource(cls, document: Mapping[str, Any]) -> "RuntimeProfile":
@@ -193,7 +194,7 @@ class RuntimeProfile:
             accelerator,
             {"resourceName", "devicesPerNode"},
             "spec.accelerator",
-            optional={"runtimeClassName"},
+            optional={"runtimeClassName", "physicalDeviceIDs"},
         )
         workspace = mapping(spec["workspace"], "spec.workspace")
         exact(workspace, {"claimName", "mountPath"}, "spec.workspace")
@@ -217,6 +218,25 @@ class RuntimeProfile:
             raise ApiValidationError("rankTableProvider must be clusterd")
         if health not in {"npu-exporter", "kubernetes"}:
             raise ApiValidationError("unsupported healthProvider")
+        devices_per_node = positive(
+            accelerator["devicesPerNode"], "devicesPerNode", maximum=64
+        )
+        raw_physical_device_ids = accelerator.get("physicalDeviceIDs", [])
+        if not isinstance(raw_physical_device_ids, list) or any(
+            isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 63
+            for item in raw_physical_device_ids
+        ):
+            raise ApiValidationError("physicalDeviceIDs must contain integers from 0 to 63")
+        physical_device_ids = tuple(raw_physical_device_ids)
+        if len(physical_device_ids) != len(set(physical_device_ids)):
+            raise ApiValidationError("physicalDeviceIDs must be unique")
+        if physical_device_ids and len(physical_device_ids) != devices_per_node:
+            raise ApiValidationError("physicalDeviceIDs must match devicesPerNode")
+        resource_name = text(accelerator["resourceName"], "resourceName")
+        if physical_device_ids and resource_name != "huawei.com/Ascend910":
+            raise ApiValidationError(
+                "physicalDeviceIDs currently requires resourceName huawei.com/Ascend910"
+            )
         pod_template = mapping(spec.get("podTemplate", {}), "spec.podTemplate")
         exact(pod_template, set(), "spec.podTemplate", optional={"head", "worker"})
         head = mapping(pod_template.get("head", {}), "spec.podTemplate.head")
@@ -231,8 +251,8 @@ class RuntimeProfile:
             head_image=image(images["head"], "images.head"),
             worker_image=image(images["worker"], "images.worker"),
             ray_version=text(spec["rayVersion"], "rayVersion"),
-            resource_name=text(accelerator["resourceName"], "resourceName"),
-            devices_per_node=positive(accelerator["devicesPerNode"], "devicesPerNode", maximum=64),
+            resource_name=resource_name,
+            devices_per_node=devices_per_node,
             runtime_class_name=(
                 dns(accelerator["runtimeClassName"], "runtimeClassName")
                 if accelerator.get("runtimeClassName")
@@ -268,6 +288,7 @@ class RuntimeProfile:
             ),
             head_ray_cpus=positive(head.get("rayCpus", 2), "podTemplate.head.rayCpus"),
             worker_ray_cpus=positive(worker.get("rayCpus", 32), "podTemplate.worker.rayCpus"),
+            physical_device_ids=physical_device_ids,
         )
 
 

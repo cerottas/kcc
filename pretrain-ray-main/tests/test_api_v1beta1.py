@@ -55,7 +55,11 @@ class ApiV1Beta1Tests(unittest.TestCase):
                 {
                     "images": {"head": IMAGE, "worker": IMAGE, "pullSecrets": ["registry-credentials"]},
                     "rayVersion": "2.49.0",
-                    "accelerator": {"resourceName": "huawei.com/Ascend910", "devicesPerNode": 8},
+                    "accelerator": {
+                        "resourceName": "huawei.com/Ascend910",
+                        "devicesPerNode": 2,
+                        "physicalDeviceIDs": [0, 1],
+                    },
                     "workspace": {"claimName": "workspace", "mountPath": "/workspace"},
                     "scheduling": {
                         "activeNodes": ["node-a"],
@@ -81,6 +85,27 @@ class ApiV1Beta1Tests(unittest.TestCase):
         self.assertIsNone(profile.runtime_class_name)
         self.assertEqual(profile.image_pull_secrets, ("registry-credentials",))
         self.assertEqual(profile.worker_ray_cpus, 64)
+        self.assertEqual(profile.physical_device_ids, (0, 1))
+
+    def test_profile_rejects_invalid_physical_device_allocation(self) -> None:
+        document = resource(
+            "TrainingRuntimeProfile",
+            "bad-devices",
+            {
+                "images": {"head": IMAGE, "worker": IMAGE},
+                "rayVersion": "2.49.0",
+                "accelerator": {
+                    "resourceName": "huawei.com/Ascend910",
+                    "devicesPerNode": 2,
+                    "physicalDeviceIDs": [0],
+                },
+                "workspace": {"claimName": "workspace", "mountPath": "/workspace"},
+                "scheduling": {"activeNodes": ["node-a"], "spareNodes": [], "headSelector": {}, "workerSelector": {}},
+                "integrations": {"rankTableProvider": "clusterd", "healthProvider": "kubernetes"},
+            },
+        )
+        with self.assertRaisesRegex(ApiValidationError, "must match"):
+            RuntimeProfile.from_resource(document)
 
     def test_profile_rejects_unimplemented_ranktable_provider(self) -> None:
         document = resource(

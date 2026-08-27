@@ -191,6 +191,28 @@ def render_attempt(
     }
     head_labels = {**labels, "training.kcc.io/role": "head"}
     worker_labels = {**labels, "training.kcc.io/role": "worker"}
+    worker_metadata: dict[str, Any] = {"labels": worker_labels}
+    worker_environment: list[dict[str, Any]] = [
+        {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
+        {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
+        {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}},
+        {"name": "HOST_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}},
+    ]
+    if profile.physical_device_ids:
+        physical = ",".join(str(item) for item in profile.physical_device_ids)
+        logical = ",".join(str(item) for item in range(profile.devices_per_node))
+        worker_metadata["annotations"] = {
+            profile.resource_name: ",".join(
+                f"Ascend910-{item}" for item in profile.physical_device_ids
+            )
+        }
+        worker_environment.extend(
+            [
+                {"name": "ASCEND_VISIBLE_DEVICES", "value": physical},
+                {"name": "ASCEND_RT_VISIBLE_DEVICES", "value": logical},
+                {"name": "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES", "value": "1"},
+            ]
+        )
     spec = runtime_spec(run, profile, recipe, attempt=attempt, active_nodes=active_nodes)
     configmap = {
         "apiVersion": "v1",
@@ -266,7 +288,7 @@ def render_attempt(
                         "resources": json.dumps({"NPU": profile.devices_per_node, "trainctl_worker": 1}),
                     },
                     "template": {
-                        "metadata": {"labels": worker_labels},
+                        "metadata": worker_metadata,
                         "spec": {
                             "automountServiceAccountToken": False,
                             "runtimeClassName": profile.runtime_class_name,
@@ -302,12 +324,7 @@ def render_attempt(
                                     "image": profile.worker_image,
                                     "imagePullPolicy": "IfNotPresent",
                                     "resources": _worker_resources(profile),
-                                    "env": [
-                                        {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
-                                        {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
-                                        {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}},
-                                        {"name": "HOST_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}},
-                                    ],
+                                    "env": worker_environment,
                                     "volumeMounts": mounts,
                                 }
                             ],

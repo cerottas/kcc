@@ -12,6 +12,8 @@ spec:
   accelerator:
     resourceName: huawei.com/Ascend910
     devicesPerNode: 8
+    # Optional: pin exact Ascend physical IDs with an equally sized list.
+    # physicalDeviceIDs: [0, 1, 2, 3, 4, 5, 6, 7]
     runtimeClassName: ascend
   workspace:
     claimName: kcc-workspace

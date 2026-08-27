@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kcc-training"
-version = "1.1.2"
+version = "1.1.3"
 description = "Portable Kubernetes control plane for Ray-based Ascend distributed training"
 readme = "README.md"
 requires-python = ">=3.10"

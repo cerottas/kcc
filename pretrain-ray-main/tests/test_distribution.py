@@ -56,6 +56,18 @@ class DistributionTests(unittest.TestCase):
             schema["integrations"]["properties"]["rankTableProvider"]["enum"],
             ["clusterd"],
         )
+        accelerator = schema["accelerator"]
+        physical_device_ids = accelerator["properties"]["physicalDeviceIDs"]
+        self.assertEqual(physical_device_ids["x-kubernetes-list-type"], "set")
+        self.assertEqual(physical_device_ids["maxItems"], 64)
+        self.assertEqual(physical_device_ids["items"]["maximum"], 63)
+        self.assertTrue(
+            any(
+                "physicalDeviceIDs" in validation["rule"]
+                and "devicesPerNode" in validation["rule"]
+                for validation in accelerator["x-kubernetes-validations"]
+            )
+        )
         pull_secret = schema["images"]["properties"]["pullSecrets"]["items"]
         self.assertLessEqual(len("registry.credentials"), pull_secret["maxLength"])
         self.assertIsNotNone(re.fullmatch(pull_secret["pattern"], "registry.credentials"))
