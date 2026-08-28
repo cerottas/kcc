@@ -294,7 +294,10 @@ def render_attempt(
                     "maxReplicas": len(active_nodes),
                     "rayStartParams": {
                         "num-cpus": str(profile.worker_ray_cpus),
-                        "resources": json.dumps({"NPU": profile.devices_per_node, "trainctl_worker": 1}),
+                        "resources": json.dumps(
+                            {"NPU": profile.devices_per_node, "trainctl_worker": 1},
+                            separators=(",", ":"),
+                        ),
                     },
                     "template": {
                         "metadata": worker_metadata,
