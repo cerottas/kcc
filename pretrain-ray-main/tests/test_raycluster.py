@@ -97,6 +97,23 @@ class RayClusterTests(unittest.TestCase):
         self.assertEqual(head["template"]["spec"]["imagePullSecrets"], [{"name": "registry-credentials"}])
         self.assertNotIn("runtimeClassName", worker["template"]["spec"])
 
+    def test_cpu_only_ascend_head_skips_volcano_device_validation(self) -> None:
+        _configmap, cluster = render_attempt(
+            *objects(),
+            attempt=0,
+            active_nodes=("node-a", "node-b"),
+            runtime_service_account="runtime",
+        )
+        head = cluster["spec"]["headGroupSpec"]["template"]
+        worker = cluster["spec"]["workerGroupSpecs"][0]["template"]
+        self.assertEqual(
+            head["metadata"]["annotations"]["huawei.com/skip-ascend-plugin"],
+            "enabled",
+        )
+        self.assertNotIn(
+            "huawei.com/skip-ascend-plugin", worker["metadata"].get("annotations", {})
+        )
+
     def test_worker_anti_affinity_does_not_exclude_the_head(self) -> None:
         _configmap, cluster = render_attempt(
             *objects(),

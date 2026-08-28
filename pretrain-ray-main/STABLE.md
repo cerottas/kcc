@@ -1,12 +1,12 @@
 # Stable 1.1 发布入口
 
 KCC Training 1.1 的唯一发布面是 `deploy/helm/kcc-training-stable`。包版本、Chart
-`version/appVersion` 和 `kcc_training.__version__` 必须一致；当前为 1.1.3。
+`version/appVersion` 和 `kcc_training.__version__` 必须一致；当前为 1.1.4。
 
 ## 支持边界
 
 - Kubernetes API：`training.kcc.io/v1beta1`；
-- Kubernetes 兼容：1.1.3 的三个 CRD 已通过 K3s 1.34.6 API server dry-run；
+- Kubernetes 兼容：1.1.4 的三个 CRD 已通过 K3s 1.34.6 API server dry-run；
   stable audit 禁止混用 `properties`/`additionalProperties` 和二次复杂度 `uniqueItems`；
 - RankTable：仅 `clusterd`；
 - 制品：仅 `artifact://namespace/name/version`；
@@ -16,6 +16,9 @@ KCC Training 1.1 的唯一发布面是 `deploy/helm/kcc-training-stable`。包�
 - 控制状态：TrainingRun status 和 Lease，不依赖管理节点本地文件；
 - 可选物理卡固定：`accelerator.physicalDeviceIDs` 仅用于 `huawei.com/Ascend910`，
   数量必须等于 `devicesPerNode`，并渲染设备注解及物理/逻辑可见设备环境变量。
+- Volcano：Ascend RuntimeProfile 的 CPU-only Ray Head 自动标记
+  `huawei.com/skip-ascend-plugin=enabled`；NPU Worker 仍由 Ascend-for-Volcano
+  按资源数量和拓扑分配设备。
 
 RuntimeProfile 和 Recipe 不可变；TrainingRun 仅允许修改 `suspend`。需要改变镜像、节点、
 命令或恢复预算时，创建新的版本化对象或新的 TrainingRun。
@@ -42,7 +45,7 @@ npuExporter:
 
 ```bash
 make check
-scripts/build-stable-bundle.sh --metadata-only /tmp/kcc-bundle 1.1.3 \
+scripts/build-stable-bundle.sh --metadata-only /tmp/kcc-bundle 1.1.4 \
   controller@sha256:... head@sha256:... worker@sha256:...
 ```
 

@@ -191,6 +191,14 @@ def render_attempt(
     }
     head_labels = {**labels, "training.kcc.io/role": "head"}
     worker_labels = {**labels, "training.kcc.io/role": "worker"}
+    head_metadata: dict[str, Any] = {"labels": head_labels}
+    if profile.resource_name == "huawei.com/Ascend910":
+        # KubeRay puts the CPU-only head and NPU workers in one Volcano
+        # PodGroup. Ascend-for-Volcano explicitly requires this annotation on
+        # a zero-NPU task so the worker allocation can be validated normally.
+        head_metadata["annotations"] = {
+            "huawei.com/skip-ascend-plugin": "enabled"
+        }
     worker_metadata: dict[str, Any] = {"labels": worker_labels}
     worker_environment: list[dict[str, Any]] = [
         {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
@@ -260,7 +268,7 @@ def render_attempt(
                 "serviceType": "ClusterIP",
                 "rayStartParams": {"dashboard-host": "0.0.0.0", "num-cpus": str(profile.head_ray_cpus)},
                 "template": {
-                    "metadata": {"labels": head_labels},
+                    "metadata": head_metadata,
                     "spec": {
                         "serviceAccountName": runtime_service_account,
                         "nodeSelector": dict(profile.head_selector),
