@@ -1,12 +1,12 @@
 # Stable 1.1 发布入口
 
 KCC Training 1.1 的唯一发布面是 `deploy/helm/kcc-training-stable`。包版本、Chart
-`version/appVersion` 和 `kcc_training.__version__` 必须一致；当前为 1.1.4。
+`version/appVersion` 和 `kcc_training.__version__` 必须一致；当前为 1.1.5。
 
 ## 支持边界
 
 - Kubernetes API：`training.kcc.io/v1beta1`；
-- Kubernetes 兼容：1.1.4 的三个 CRD 已通过 K3s 1.34.6 API server dry-run；
+- Kubernetes 兼容：1.1.5 的三个 CRD 已通过 K3s 1.34.6 API server dry-run；
   stable audit 禁止混用 `properties`/`additionalProperties` 和二次复杂度 `uniqueItems`；
 - RankTable：仅 `clusterd`；
 - 制品：仅 `artifact://namespace/name/version`；
@@ -46,7 +46,7 @@ npuExporter:
 
 ```bash
 make check
-scripts/build-stable-bundle.sh --metadata-only /tmp/kcc-bundle 1.1.4 \
+scripts/build-stable-bundle.sh --metadata-only /tmp/kcc-bundle 1.1.5 \
   controller@sha256:... head@sha256:... worker@sha256:...
 ```
 

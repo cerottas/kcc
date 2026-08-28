@@ -1,4 +1,5 @@
 import unittest
+import json
 from dataclasses import replace
 
 from kcc_training.api_v1beta1 import Recipe, Run, RuntimeProfile
@@ -188,6 +189,40 @@ class RayClusterTests(unittest.TestCase):
     def test_nodes_outside_admin_profile_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "outside"):
             render_attempt(*objects(), attempt=0, active_nodes=("node-a", "rogue"), runtime_service_account="runtime")
+
+    def test_run_overrides_are_rendered_without_replacing_controller_values(self) -> None:
+        run, profile, recipe = objects()
+        run = replace(
+            run,
+            command_arguments=("--micro-batch-size", "2"),
+            environment={"CUSTOM_FLAG": "enabled"},
+            source_uri="artifact://training/source/v2",
+            output_subpath="runs/custom",
+        )
+        configmap, _cluster = render_attempt(
+            run,
+            profile,
+            recipe,
+            attempt=0,
+            active_nodes=("node-a", "node-b"),
+            runtime_service_account="runtime",
+        )
+
+        runtime = json.loads(configmap["data"]["run.json"])
+        self.assertEqual(
+            runtime["training"]["command"],
+            ["python", "pretrain.py", "--micro-batch-size", "2"],
+        )
+        self.assertEqual(runtime["training"]["environment"]["CUSTOM_FLAG"], "enabled")
+        self.assertEqual(
+            runtime["artifacts"]["source"]["uri"],
+            "artifact://training/source/v2",
+        )
+        self.assertIn("runs/custom", runtime["artifacts"]["outputRoot"])
+        self.assertEqual(
+            runtime["training"]["environment"]["KCC_SOURCE_DIR"],
+            runtime["artifacts"]["source"]["target"],
+        )
 
 
 if __name__ == "__main__":

@@ -209,6 +209,86 @@ class ApiV1Beta1Tests(unittest.TestCase):
         with self.assertRaisesRegex(ApiValidationError, "permits 1111 attempts"):
             Run.from_resource(document)
 
+    def test_run_accepts_selected_nodes_and_training_overrides(self) -> None:
+        run = Run.from_resource(
+            resource(
+                "TrainingRun",
+                "run-selected",
+                {
+                    "runtimeProfile": "a3",
+                    "recipe": "recipe",
+                    "workers": 2,
+                    "nodeSelection": {
+                        "activeNodes": ["node-b", "node-c"],
+                        "spareNodes": ["node-a"],
+                    },
+                    "training": {
+                        "arguments": ["--micro-batch-size", "2"],
+                        "environment": {"CUSTOM_FLAG": "enabled"},
+                        "artifacts": {
+                            "source": "artifact://training/source/v2",
+                            "outputSubpath": "runs/custom",
+                        },
+                    },
+                    "recovery": {
+                        "sameTopologyRetries": 1,
+                        "maxReplacements": 1,
+                        "noProgressSeconds": 600,
+                    },
+                },
+            )
+        )
+        self.assertEqual(run.active_nodes, ("node-b", "node-c"))
+        self.assertEqual(run.spare_nodes, ("node-a",))
+        self.assertEqual(run.command_arguments, ("--micro-batch-size", "2"))
+        self.assertEqual(run.environment, {"CUSTOM_FLAG": "enabled"})
+        self.assertEqual(run.source_uri, "artifact://training/source/v2")
+        self.assertEqual(run.output_subpath, "runs/custom")
+
+    def test_run_rejects_invalid_selected_topology(self) -> None:
+        document = resource(
+            "TrainingRun",
+            "run-selected",
+            {
+                "runtimeProfile": "a3",
+                "recipe": "recipe",
+                "workers": 2,
+                "nodeSelection": {
+                    "activeNodes": ["node-a", "node-b"],
+                    "spareNodes": ["node-b"],
+                },
+                "recovery": {
+                    "sameTopologyRetries": 1,
+                    "maxReplacements": 1,
+                    "noProgressSeconds": 600,
+                },
+            },
+        )
+        with self.assertRaisesRegex(ApiValidationError, "disjoint"):
+            Run.from_resource(document)
+        document["spec"]["nodeSelection"]["spareNodes"] = []
+        with self.assertRaisesRegex(ApiValidationError, "maxReplacements"):
+            Run.from_resource(document)
+
+    def test_run_rejects_controller_environment_override(self) -> None:
+        document = resource(
+            "TrainingRun",
+            "run-env",
+            {
+                "runtimeProfile": "a3",
+                "recipe": "recipe",
+                "workers": 1,
+                "training": {"environment": {"RANK_TABLE_FILE": "/tmp/wrong"}},
+                "recovery": {
+                    "sameTopologyRetries": 0,
+                    "maxReplacements": 0,
+                    "noProgressSeconds": 600,
+                },
+            },
+        )
+        with self.assertRaisesRegex(ApiValidationError, "controller-owned"):
+            Run.from_resource(document)
+
 
 if __name__ == "__main__":
     unittest.main()

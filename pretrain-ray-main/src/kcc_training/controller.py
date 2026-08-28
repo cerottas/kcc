@@ -320,14 +320,23 @@ class Reconciler:
             return self._suspend(resource, run, current, phase)
         if phase == "Suspended":
             return self._resume(resource, run, current)
-        if run.workers > len(profile.active_nodes):
-            raise ControllerError("RuntimeProfile has insufficient active nodes")
-        if run.max_replacements > len(profile.spare_nodes):
+        profile_pool = set((*profile.active_nodes, *profile.spare_nodes))
+        requested_active = run.active_nodes or profile.active_nodes[: run.workers]
+        requested_spares = run.spare_nodes if run.active_nodes else profile.spare_nodes
+        if len(requested_active) != run.workers:
+            raise ControllerError("selected active node count differs from workers")
+        if len(requested_active) != len(set(requested_active)):
+            raise ControllerError("selected active nodes contain duplicates")
+        if set(requested_active) & set(requested_spares):
+            raise ControllerError("selected active and spare nodes overlap")
+        if not set((*requested_active, *requested_spares)) <= profile_pool:
+            raise ControllerError("selected nodes are outside the RuntimeProfile pool")
+        if run.max_replacements > len(requested_spares):
             raise ControllerError("recovery budget exceeds the spare pool")
 
         attempt = int(current.get("attempt", 0))
-        active = tuple(current.get("activeNodes", profile.active_nodes[: run.workers]))
-        spares = tuple(current.get("spareNodes", profile.spare_nodes))
+        active = tuple(current.get("activeNodes", requested_active))
+        spares = tuple(current.get("spareNodes", requested_spares))
         expected_name = attempt_name(run.identity.name, attempt)
         persisted_name = current.get("clusterName")
         cluster_name = persisted_name if isinstance(persisted_name, str) and persisted_name else expected_name

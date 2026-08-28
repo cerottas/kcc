@@ -114,9 +114,13 @@ def runtime_spec(
     attempt: int,
     active_nodes: Sequence[str],
 ) -> dict[str, Any]:
-    source_target = _artifact_target(profile.workspace_mount_path, "source", recipe.source_uri)
-    model_target = _artifact_target(profile.workspace_mount_path, "model", recipe.model_uri)
-    data_target = _artifact_target(profile.workspace_mount_path, "data", recipe.data_uri)
+    source_uri = run.source_uri or recipe.source_uri
+    model_uri = run.model_uri or recipe.model_uri
+    data_uri = run.data_uri or recipe.data_uri
+    output_subpath = run.output_subpath or recipe.output_subpath
+    source_target = _artifact_target(profile.workspace_mount_path, "source", source_uri)
+    model_target = _artifact_target(profile.workspace_mount_path, "model", model_uri)
+    data_target = _artifact_target(profile.workspace_mount_path, "data", data_uri)
     working_directory = _source_working_directory(
         profile.workspace_mount_path,
         source_target,
@@ -125,12 +129,13 @@ def runtime_spec(
     run_identity = hashlib.sha256(run.identity.uid.encode("utf-8")).hexdigest()[:12]
     output_root = str(
         PurePosixPath(profile.workspace_mount_path)
-        / recipe.output_subpath
+        / output_subpath
         / f"{run.identity.name}-{run_identity}"
     )
     checkpoint_root = str(PurePosixPath(output_root) / "checkpoints")
     environment = {
         **dict(recipe.environment),
+        **dict(run.environment),
         "KCC_SOURCE_DIR": source_target,
         "KCC_MODEL_DIR": model_target,
         "KCC_DATA_DIR": data_target,
@@ -154,16 +159,16 @@ def runtime_spec(
         },
         "training": {
             "framework": recipe.framework,
-            "command": list(recipe.command),
+            "command": [*recipe.command, *run.command_arguments],
             "workingDirectory": working_directory,
             "environment": environment,
             "noProgressSeconds": run.no_progress_seconds,
         },
         "artifacts": {
             "provider": profile.artifact_provider,
-            "source": {"uri": recipe.source_uri, "target": source_target},
-            "model": {"uri": recipe.model_uri, "target": model_target},
-            "data": {"uri": recipe.data_uri, "target": data_target},
+            "source": {"uri": source_uri, "target": source_target},
+            "model": {"uri": model_uri, "target": model_target},
+            "data": {"uri": data_uri, "target": data_target},
             "outputRoot": output_root,
             "checkpointRoot": checkpoint_root,
         },

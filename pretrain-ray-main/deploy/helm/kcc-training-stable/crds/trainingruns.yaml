@@ -35,11 +35,29 @@ spec:
                     (self.recovery.sameTopologyRetries + 1) <= 100
                   message: total recovery attempt budget must not exceed 100
                 - rule: >-
+                    !has(self.nodeSelection) ||
+                    size(self.nodeSelection.activeNodes) == self.workers
+                  message: nodeSelection.activeNodes must contain exactly workers entries
+                - rule: >-
+                    !has(self.nodeSelection) ||
+                    self.nodeSelection.activeNodes.all(node, !(node in self.nodeSelection.spareNodes))
+                  message: activeNodes and spareNodes must be disjoint
+                - rule: >-
+                    !has(self.nodeSelection) ||
+                    self.recovery.maxReplacements <= size(self.nodeSelection.spareNodes)
+                  message: maxReplacements must not exceed the selected spare node count
+                - rule: >-
                     self.runtimeProfile == oldSelf.runtimeProfile &&
                     self.recipe == oldSelf.recipe &&
                     self.workers == oldSelf.workers &&
-                    self.recovery == oldSelf.recovery
-                  message: runtimeProfile, recipe, workers, and recovery are immutable; only suspend and suspendMode may change
+                    self.recovery == oldSelf.recovery &&
+                    ((!has(self.nodeSelection) && !has(oldSelf.nodeSelection)) ||
+                     (has(self.nodeSelection) && has(oldSelf.nodeSelection) &&
+                      self.nodeSelection == oldSelf.nodeSelection)) &&
+                    ((!has(self.training) && !has(oldSelf.training)) ||
+                     (has(self.training) && has(oldSelf.training) &&
+                      self.training == oldSelf.training))
+                  message: runtimeProfile, recipe, workers, recovery, nodeSelection, and training are immutable; only suspend and suspendMode may change
               properties:
                 runtimeProfile:
                   type: string
@@ -62,6 +80,56 @@ spec:
                     sameTopologyRetries: {type: integer, minimum: 0, maximum: 10}
                     maxReplacements: {type: integer, minimum: 0, maximum: 100}
                     noProgressSeconds: {type: integer, minimum: 0}
+                nodeSelection:
+                  type: object
+                  required: [activeNodes, spareNodes]
+                  properties:
+                    activeNodes:
+                      type: array
+                      minItems: 1
+                      maxItems: 1024
+                      x-kubernetes-list-type: set
+                      items:
+                        type: string
+                        pattern: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+                        maxLength: 253
+                    spareNodes:
+                      type: array
+                      maxItems: 100
+                      x-kubernetes-list-type: set
+                      items:
+                        type: string
+                        pattern: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+                        maxLength: 253
+                training:
+                  type: object
+                  properties:
+                    arguments:
+                      type: array
+                      maxItems: 256
+                      items: {type: string, minLength: 1, maxLength: 4096}
+                    environment:
+                      type: object
+                      additionalProperties: {type: string}
+                    artifacts:
+                      type: object
+                      properties:
+                        source:
+                          type: string
+                          pattern: '^artifact://[^/?#\s]+/[^/?#\s]+/[^/?#\s]+$'
+                        model:
+                          type: string
+                          pattern: '^artifact://[^/?#\s]+/[^/?#\s]+/[^/?#\s]+$'
+                        data:
+                          type: string
+                          pattern: '^artifact://[^/?#\s]+/[^/?#\s]+/[^/?#\s]+$'
+                        outputSubpath:
+                          type: string
+                          minLength: 1
+                          maxLength: 1024
+                          x-kubernetes-validations:
+                            - rule: '!self.startsWith("/") && self != ".." && !self.startsWith("../") && !self.endsWith("/..") && !self.contains("/../")'
+                              message: outputSubpath must be a safe relative path
             status:
               type: object
               properties:

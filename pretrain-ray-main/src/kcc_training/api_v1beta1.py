@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from typing import Any, Mapping, Sequence
 
@@ -70,6 +70,8 @@ def artifact_uri(value: Any, label: str) -> str:
     if _ARTIFACT_URI.fullmatch(result) is None:
         raise ApiValidationError(f"{label} must be artifact://namespace/name/version")
     return result
+
+
 def string_map(value: Any, label: str) -> dict[str, str]:
     source = mapping(value, label)
     result: dict[str, str] = {}
@@ -78,6 +80,32 @@ def string_map(value: Any, label: str) -> dict[str, str]:
             raise ApiValidationError(f"{label} must contain string keys and values")
         result[key] = item
     return result
+
+
+_CONTROLLER_ENVIRONMENT = frozenset(
+    {
+        "RANK_TABLE_FILE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "NODE_RANK",
+        "WORLD_SIZE",
+        "KUBECONFIG",
+        "KCC_SOURCE_DIR",
+        "KCC_MODEL_DIR",
+        "KCC_DATA_DIR",
+        "KCC_OUTPUT_ROOT",
+        "KCC_CHECKPOINT_ROOT",
+    }
+)
+
+
+def training_environment(value: Any, label: str) -> dict[str, str]:
+    environment = string_map(value, label)
+    if any(_ENV.fullmatch(key) is None for key in environment):
+        raise ApiValidationError(f"{label} contains an invalid variable name")
+    if _CONTROLLER_ENVIRONMENT & set(environment):
+        raise ApiValidationError(f"{label} overrides controller-owned variables")
+    return environment
 
 
 def _string_list(value: Any, label: str) -> tuple[str, ...]:
@@ -326,15 +354,7 @@ class Recipe:
         spec = mapping(document.get("spec"), "spec")
         exact(spec, {"framework", "command", "workingDirectory", "environment", "artifacts"}, "spec")
         command = tuple(text(item, "command item") for item in _list(spec["command"], "command"))
-        environment = string_map(spec["environment"], "environment")
-        if any(_ENV.fullmatch(key) is None for key in environment):
-            raise ApiValidationError("environment contains an invalid variable name")
-        blocked = {
-            "RANK_TABLE_FILE", "MASTER_ADDR", "MASTER_PORT", "NODE_RANK", "WORLD_SIZE", "KUBECONFIG",
-            "KCC_SOURCE_DIR", "KCC_MODEL_DIR", "KCC_DATA_DIR", "KCC_OUTPUT_ROOT", "KCC_CHECKPOINT_ROOT",
-        }
-        if blocked & set(environment):
-            raise ApiValidationError("environment overrides controller-owned variables")
+        environment = training_environment(spec["environment"], "environment")
         artifacts = mapping(spec["artifacts"], "spec.artifacts")
         exact(artifacts, {"source", "model", "data", "outputSubpath"}, "spec.artifacts")
         cwd = text(spec["workingDirectory"], "workingDirectory")
@@ -367,6 +387,14 @@ class Run:
     no_progress_seconds: int
     suspended: bool
     suspend_mode: str
+    active_nodes: tuple[str, ...] = ()
+    spare_nodes: tuple[str, ...] = ()
+    command_arguments: tuple[str, ...] = ()
+    environment: Mapping[str, str] = field(default_factory=dict)
+    source_uri: str | None = None
+    model_uri: str | None = None
+    data_uri: str | None = None
+    output_subpath: str | None = None
 
     @classmethod
     def from_resource(cls, document: Mapping[str, Any]) -> "Run":
@@ -376,7 +404,7 @@ class Run:
             spec,
             {"runtimeProfile", "recipe", "workers", "recovery"},
             "spec",
-            optional={"suspend", "suspendMode"},
+            optional={"suspend", "suspendMode", "nodeSelection", "training"},
         )
         recovery = mapping(spec["recovery"], "spec.recovery")
         exact(recovery, {"sameTopologyRetries", "maxReplacements", "noProgressSeconds"}, "spec.recovery")
@@ -396,15 +424,64 @@ class Run:
             maximum_attempt_count(max_replacements, same_topology_retries)
         except RecoveryPolicyError as error:
             raise ApiValidationError(str(error)) from error
+        workers = positive(spec["workers"], "workers", maximum=1024)
+        node_selection = mapping(spec.get("nodeSelection", {}), "spec.nodeSelection")
+        exact(node_selection, set(), "spec.nodeSelection", optional={"activeNodes", "spareNodes"})
+        active_nodes = _string_list(node_selection.get("activeNodes"), "spec.nodeSelection.activeNodes")
+        spare_nodes = _string_list(node_selection.get("spareNodes"), "spec.nodeSelection.spareNodes")
+        if node_selection and len(active_nodes) != workers:
+            raise ApiValidationError("nodeSelection.activeNodes must contain exactly workers entries")
+        if set(active_nodes) & set(spare_nodes):
+            raise ApiValidationError("nodeSelection activeNodes and spareNodes must be disjoint")
+        if node_selection and max_replacements > len(spare_nodes):
+            raise ApiValidationError("maxReplacements exceeds selected spareNodes")
+
+        training = mapping(spec.get("training", {}), "spec.training")
+        exact(training, set(), "spec.training", optional={"arguments", "environment", "artifacts"})
+        raw_arguments = training.get("arguments", [])
+        if not isinstance(raw_arguments, list):
+            raise ApiValidationError("spec.training.arguments must be a list")
+        command_arguments = tuple(
+            text(item, "spec.training.arguments item") for item in raw_arguments
+        )
+        if len(command_arguments) > 256 or any(
+            len(item) > 4096 for item in command_arguments
+        ):
+            raise ApiValidationError(
+                "spec.training.arguments permits 256 entries of at most 4096 characters"
+            )
+        environment = training_environment(
+            training.get("environment", {}), "spec.training.environment"
+        )
+        artifacts = mapping(training.get("artifacts", {}), "spec.training.artifacts")
+        exact(
+            artifacts,
+            set(),
+            "spec.training.artifacts",
+            optional={"source", "model", "data", "outputSubpath"},
+        )
+        output_subpath = artifacts.get("outputSubpath")
+        if output_subpath is not None:
+            output_subpath = text(output_subpath, "spec.training.artifacts.outputSubpath")
+            if output_subpath.startswith("/") or ".." in output_subpath.split("/"):
+                raise ApiValidationError("spec.training.artifacts.outputSubpath is unsafe")
         return cls(
             identity=identity,
             profile_name=dns(spec["runtimeProfile"], "runtimeProfile"),
             recipe_name=dns(spec["recipe"], "recipe"),
-            workers=positive(spec["workers"], "workers", maximum=1024),
+            workers=workers,
             same_topology_retries=same_topology_retries,
             max_replacements=max_replacements,
             no_progress_seconds=positive(recovery["noProgressSeconds"], "noProgressSeconds", minimum=0),
             suspended=suspended,
             suspend_mode=suspend_mode,
+            active_nodes=active_nodes,
+            spare_nodes=spare_nodes,
+            command_arguments=command_arguments,
+            environment=environment,
+            source_uri=(artifact_uri(artifacts["source"], "spec.training.artifacts.source") if "source" in artifacts else None),
+            model_uri=(artifact_uri(artifacts["model"], "spec.training.artifacts.model") if "model" in artifacts else None),
+            data_uri=(artifact_uri(artifacts["data"], "spec.training.artifacts.data") if "data" in artifacts else None),
+            output_subpath=output_subpath,
         )
 
