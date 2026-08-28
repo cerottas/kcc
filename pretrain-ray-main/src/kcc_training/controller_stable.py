@@ -48,6 +48,13 @@ def trusted_result(
         raise engine.ControllerError("PASS result output artifact ownership differs")
     if not ref.version.startswith(f"attempt-{attempt:02d}-"):
         raise engine.ControllerError("PASS result output artifact attempt differs")
+    output_provider = result.get("outputProvider", "gateway")
+    if output_provider not in {"gateway", "workspace"}:
+        raise engine.ControllerError("PASS result output provider is invalid")
+    if output_provider == "workspace":
+        output_path = result.get("outputPath")
+        if not isinstance(output_path, str) or not output_path.startswith("/"):
+            raise engine.ControllerError("PASS workspace result lacks an absolute output path")
     return result
 
 

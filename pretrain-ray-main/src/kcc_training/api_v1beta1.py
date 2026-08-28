@@ -166,6 +166,7 @@ class RuntimeProfile:
     worker_selector: Mapping[str, str]
     ranktable_provider: str
     health_provider: str
+    artifact_provider: str
     image_pull_secrets: tuple[str, ...]
     head_resources: Mapping[str, Mapping[str, str | int]]
     worker_resources: Mapping[str, Mapping[str, str | int]]
@@ -201,7 +202,12 @@ class RuntimeProfile:
         scheduling = mapping(spec["scheduling"], "spec.scheduling")
         exact(scheduling, {"activeNodes", "spareNodes", "headSelector", "workerSelector"}, "spec.scheduling")
         integrations = mapping(spec["integrations"], "spec.integrations")
-        exact(integrations, {"rankTableProvider", "healthProvider"}, "spec.integrations")
+        exact(
+            integrations,
+            {"rankTableProvider", "healthProvider"},
+            "spec.integrations",
+            optional={"artifactProvider"},
+        )
         active = tuple(text(item, "activeNodes item") for item in _list(scheduling["activeNodes"], "activeNodes"))
         raw_spares = scheduling["spareNodes"]
         if not isinstance(raw_spares, list):
@@ -214,10 +220,13 @@ class RuntimeProfile:
             raise ApiValidationError("workspace.mountPath must be absolute")
         rank = text(integrations["rankTableProvider"], "rankTableProvider")
         health = text(integrations["healthProvider"], "healthProvider")
+        artifact = text(integrations.get("artifactProvider", "gateway"), "artifactProvider")
         if rank != "clusterd":
             raise ApiValidationError("rankTableProvider must be clusterd")
         if health not in {"npu-exporter", "kubernetes"}:
             raise ApiValidationError("unsupported healthProvider")
+        if artifact not in {"gateway", "workspace"}:
+            raise ApiValidationError("artifactProvider must be gateway or workspace")
         devices_per_node = positive(
             accelerator["devicesPerNode"], "devicesPerNode", maximum=64
         )
@@ -266,6 +275,7 @@ class RuntimeProfile:
             worker_selector=string_map(scheduling["workerSelector"], "workerSelector"),
             ranktable_provider=rank,
             health_provider=health,
+            artifact_provider=artifact,
             image_pull_secrets=_string_list(images.get("pullSecrets"), "images.pullSecrets"),
             head_resources=_resources(
                 head.get("resources"),

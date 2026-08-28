@@ -18,10 +18,6 @@ def render_attempt(
     active_nodes: Sequence[str],
     runtime_service_account: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    gateway = os.environ.get("KCC_ARTIFACT_GATEWAY")
-    if not gateway:
-        raise ValueError("KCC_ARTIFACT_GATEWAY is required for production rendering")
-    token_secret = os.environ.get("KCC_ARTIFACT_TOKEN_SECRET")
     configmap, cluster = render_base(
         run,
         profile,
@@ -39,6 +35,12 @@ def render_attempt(
             if volume.get("name") == "ranktable"
         )
         ranktable_volume["configMap"]["optional"] = True
+    if profile.artifact_provider == "workspace":
+        return configmap, cluster
+    gateway = os.environ.get("KCC_ARTIFACT_GATEWAY")
+    if not gateway:
+        raise ValueError("KCC_ARTIFACT_GATEWAY is required for gateway artifactProvider")
+    token_secret = os.environ.get("KCC_ARTIFACT_TOKEN_SECRET")
     materializer_mounts = [
         {"name": "run-spec", "mountPath": "/etc/kcc/run", "readOnly": True},
         {"name": "workspace", "mountPath": profile.workspace_mount_path},

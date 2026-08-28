@@ -175,6 +175,45 @@ class StableRuntimeTests(unittest.TestCase):
         self.assertEqual(replayed_checkpoint["sampleBytesPerFile"], 192 * 1024)
         self.assertEqual(result["status"], "PASS")
 
+    def test_workspace_result_does_not_publish_to_gateway(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            spec = SimpleNamespace(
+                output_root=root,
+                checkpoint_root=root / "checkpoints",
+                workers=3,
+                devices_per_node=2,
+                command=("python", "train.py"),
+                working_directory=root,
+                environment={},
+                run_name="run-1",
+                namespace="training",
+                run_uid="uid-1",
+                attempt=0,
+                artifact_provider="workspace",
+            )
+            trained = {
+                "schemaVersion": "kcc-runtime-result/v1",
+                "runName": "run-1",
+                "namespace": "training",
+                "runUid": "uid-1",
+                "attempt": 0,
+                "status": "PASS",
+                "checkpointConsistent": True,
+                "checkpointAvailable": False,
+                "checkpoint": None,
+                "failureScope": None,
+                "failedNodes": [],
+            }
+            execute_fn = Mock(return_value=trained)
+            result = release_module.run_workspace(spec, execute_fn=execute_fn)
+        execute_fn.assert_called_once_with(spec)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["outputProvider"], "workspace")
+        self.assertEqual(result["outputPath"], str(root))
+        self.assertIn("/attempt-00-workspace-", result["outputArtifact"])
+        self.assertEqual(result["publicationAttempts"], 0)
+
     def test_missing_gateway_publishes_structured_artifact_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

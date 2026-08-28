@@ -197,6 +197,7 @@ class TrainingRuntimeProfile:
     devices_per_node: int
     rank_table_provider: str
     health_provider: str
+    artifact_provider: str
     workspace_claim: str
     workspace_mount_path: str
     active_nodes: tuple[str, ...]
@@ -250,13 +251,24 @@ class TrainingRuntimeProfile:
                 "physicalDeviceIDs currently requires resourceName huawei.com/Ascend910"
             )
         integrations = _mapping(spec["integrations"], "spec.integrations")
-        _exact_keys(integrations, {"rankTableProvider", "healthProvider"}, "spec.integrations")
+        _exact_keys(
+            integrations,
+            {"rankTableProvider", "healthProvider"},
+            "spec.integrations",
+            optional={"artifactProvider"},
+        )
         rank_provider = _text(integrations["rankTableProvider"], "rankTableProvider")
         if rank_provider != "clusterd":
             raise ContractError("rankTableProvider must be clusterd")
         health_provider = _text(integrations["healthProvider"], "healthProvider")
         if health_provider not in {"kubernetes", "npu-exporter"}:
             raise ContractError("healthProvider must be kubernetes or npu-exporter")
+        artifact_provider = _text(
+            integrations.get("artifactProvider", "gateway"), "artifactProvider"
+        )
+        if artifact_provider not in {"gateway", "workspace"}:
+            raise ContractError("artifactProvider must be gateway or workspace")
+
         workspace = _mapping(spec["workspace"], "spec.workspace")
         _exact_keys(workspace, {"claimName", "mountPath"}, "spec.workspace")
         mount_path = _text(workspace["mountPath"], "spec.workspace.mountPath")
@@ -291,6 +303,7 @@ class TrainingRuntimeProfile:
             rank_table_provider=rank_provider,
             health_provider=health_provider,
             workspace_claim=_name(workspace["claimName"], "spec.workspace.claimName"),
+            artifact_provider=artifact_provider,
             workspace_mount_path=mount_path,
             active_nodes=active,
             spare_nodes=spare,

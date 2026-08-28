@@ -160,6 +160,7 @@ def runtime_spec(
             "noProgressSeconds": run.no_progress_seconds,
         },
         "artifacts": {
+            "provider": profile.artifact_provider,
             "source": {"uri": recipe.source_uri, "target": source_target},
             "model": {"uri": recipe.model_uri, "target": model_target},
             "data": {"uri": recipe.data_uri, "target": data_target},

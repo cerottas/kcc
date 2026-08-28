@@ -106,6 +106,7 @@ spec:
                   properties:
                     rankTableProvider: {type: string, enum: [clusterd]}
                     healthProvider: {type: string, enum: [npu-exporter, kubernetes]}
+                    artifactProvider: {type: string, enum: [gateway, workspace], default: gateway}
                 podTemplate:
                   type: object
                   properties:

@@ -28,6 +28,8 @@ def render_attempt(
     )
     head_spec = cluster["spec"]["headGroupSpec"]["template"]["spec"]
     head = head_spec["containers"][0]
+    if profile.artifact_provider == "workspace":
+        return configmap, cluster
     head.setdefault("env", []).append(
         {"name": "KCC_ARTIFACT_GATEWAY", "value": os.environ["KCC_ARTIFACT_GATEWAY"]}
     )

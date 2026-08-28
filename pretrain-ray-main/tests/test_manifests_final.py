@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 import os
 import unittest
 from unittest.mock import patch
@@ -28,6 +29,22 @@ class FinalManifestTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "GATEWAY"):
                 render_attempt(*objects(), attempt=0, active_nodes=("node-a", "node-b"), runtime_service_account="runtime")
+
+    def test_workspace_provider_skips_gateway_materialization(self):
+        run, profile, recipe = objects()
+        profile = replace(profile, artifact_provider="workspace")
+        with patch.dict(os.environ, {}, clear=True):
+            configmap, cluster = render_attempt(
+                run,
+                profile,
+                recipe,
+                attempt=0,
+                active_nodes=("node-a", "node-b"),
+                runtime_service_account="runtime",
+            )
+        runtime = json.loads(configmap["data"]["run.json"])
+        head_spec = cluster["spec"]["headGroupSpec"]["template"]["spec"]
+        self.assertEqual(runtime["artifacts"]["provider"], "workspace")
 
 
 if __name__ == "__main__":

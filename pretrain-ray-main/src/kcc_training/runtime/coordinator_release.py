@@ -46,6 +46,7 @@ def _training_binding(spec: RuntimeSpec) -> str:
         "environment": dict(spec.environment),
         "outputRoot": str(spec.output_root),
         "checkpointRoot": str(spec.checkpoint_root),
+        "artifactProvider": getattr(spec, "artifact_provider", "gateway"),
     }
     payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
@@ -229,6 +230,37 @@ def run(
     result["publicationAttempts"] = attempts_used
     return result
 
+def run_workspace(
+    spec: RuntimeSpec,
+    *,
+    execute_fn: Callable[[RuntimeSpec], Mapping[str, Any]] = execute,
+) -> Mapping[str, Any]:
+    result = _load_completion(spec)
+    if result is None:
+        result = dict(execute_fn(spec))
+        if result.get("status") != "PASS":
+            return result
+        result.setdefault("trainingAttempt", spec.attempt)
+        try:
+            _write_completion(spec, result)
+        except Exception as error:
+            failed = failure_result(spec, error, base=result, scope="artifact")
+            failed.update(trainingStatus="PASS", publicationRetryable=True)
+            return failed
+    result["trainingStatus"] = "PASS"
+    receipt_digest = hashlib.sha256(_receipt_path(spec).read_bytes()).hexdigest()[:16]
+    result.update(
+        outputProvider="workspace",
+        outputPath=str(spec.output_root),
+        outputArtifact=(
+            f"artifact://{spec.namespace}/{spec.run_name}-output/"
+            f"attempt-{spec.attempt:02d}-workspace-{receipt_digest}"
+        ),
+        publicationRetryable=False,
+        publicationAttempts=0,
+    )
+    return result
+
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -248,10 +280,13 @@ def main(
     spec: RuntimeSpec | None = None
     try:
         spec = RuntimeSpec.load(args.spec)
-        if not args.gateway:
-            raise ArtifactError("artifact gateway is required")
-        gateway = ArtifactGateway(args.gateway, token=_token(args.token_file))
-        result = run(spec, gateway, execute_fn=execute_fn, publish_fn=publish_fn)
+        if getattr(spec, "artifact_provider", "gateway") == "workspace":
+            result = run_workspace(spec, execute_fn=execute_fn)
+        else:
+            if not args.gateway:
+                raise ArtifactError("artifact gateway is required")
+            gateway = ArtifactGateway(args.gateway, token=_token(args.token_file))
+            result = run(spec, gateway, execute_fn=execute_fn, publish_fn=publish_fn)
     except Exception as error:
         if spec is None:
             print(f"runtime refused invalid spec: {error}", file=sys.stderr)

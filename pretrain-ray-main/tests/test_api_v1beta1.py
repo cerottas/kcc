@@ -46,6 +46,7 @@ class ApiV1Beta1Tests(unittest.TestCase):
         )
         self.assertEqual(profile.devices_per_node, 8)
         self.assertEqual(profile.active_nodes, ("node-a", "node-b"))
+        self.assertEqual(profile.artifact_provider, "gateway")
 
     def test_profile_supports_portable_pod_options_and_empty_spares(self) -> None:
         profile = RuntimeProfile.from_resource(
@@ -67,7 +68,7 @@ class ApiV1Beta1Tests(unittest.TestCase):
                         "headSelector": {},
                         "workerSelector": {},
                     },
-                    "integrations": {"rankTableProvider": "clusterd", "healthProvider": "kubernetes"},
+                    "integrations": {"rankTableProvider": "clusterd", "healthProvider": "kubernetes", "artifactProvider": "workspace"},
                     "podTemplate": {
                         "head": {"rayCpus": 4, "priorityClassName": "training", "tolerations": [{"operator": "Exists"}]},
                         "worker": {
@@ -86,6 +87,7 @@ class ApiV1Beta1Tests(unittest.TestCase):
         self.assertEqual(profile.image_pull_secrets, ("registry-credentials",))
         self.assertEqual(profile.worker_ray_cpus, 64)
         self.assertEqual(profile.physical_device_ids, (0, 1))
+        self.assertEqual(profile.artifact_provider, "workspace")
 
     def test_profile_rejects_invalid_physical_device_allocation(self) -> None:
         document = resource(

@@ -1,4 +1,5 @@
 import io
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -110,6 +111,23 @@ class ReleasePathTests(unittest.TestCase):
         self.assertIn({"name": "KCC_ARTIFACT_GATEWAY", "value": environment["KCC_ARTIFACT_GATEWAY"]}, head["env"])
         token = next(item for item in head["volumeMounts"] if item["name"] == "artifact-token")
         self.assertTrue(token["readOnly"])
+
+    def test_workspace_head_has_no_gateway_dependency(self):
+        run, profile, recipe = objects()
+        profile = replace(profile, artifact_provider="workspace")
+        with patch.dict(os.environ, {}, clear=True):
+            _configmap, cluster = render_attempt(
+                run,
+                profile,
+                recipe,
+                attempt=0,
+                active_nodes=("node-a", "node-b"),
+                runtime_service_account="runtime",
+            )
+        head_spec = cluster["spec"]["headGroupSpec"]["template"]["spec"]
+        head = head_spec["containers"][0]
+        self.assertNotIn("initContainers", head_spec)
+        self.assertNotIn("KCC_ARTIFACT_GATEWAY", str(head.get("env", [])))
 
 
 if __name__ == "__main__":

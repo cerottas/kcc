@@ -48,6 +48,7 @@ class RuntimeSpec:
     no_progress_seconds: int
     output_root: Path
     checkpoint_root: Path
+    artifact_provider: str
 
     @classmethod
     def load(cls, path: Path) -> "RuntimeSpec":
@@ -66,6 +67,11 @@ class RuntimeSpec:
         topology = _mapping(root.get("topology"), "topology")
         training = _mapping(root.get("training"), "training")
         artifacts = _mapping(root.get("artifacts"), "artifacts")
+        artifact_provider = _text(
+            artifacts.get("provider", "gateway"), "artifacts.provider"
+        )
+        if artifact_provider not in {"gateway", "workspace"}:
+            raise RuntimeSpecError("artifacts.provider must be gateway or workspace")
         workers = _integer(topology.get("workers"), "workers", 1)
         raw_nodes = topology.get("nodes")
         if not isinstance(raw_nodes, list):
@@ -107,5 +113,6 @@ class RuntimeSpec:
             no_progress_seconds=_integer(training.get("noProgressSeconds"), "noProgressSeconds"),
             output_root=output,
             checkpoint_root=checkpoint,
+            artifact_provider=artifact_provider,
         )
 

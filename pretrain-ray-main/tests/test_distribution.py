@@ -56,6 +56,11 @@ class DistributionTests(unittest.TestCase):
             schema["integrations"]["properties"]["rankTableProvider"]["enum"],
             ["clusterd"],
         )
+        artifact_provider = schema["integrations"]["properties"]["artifactProvider"]
+        self.assertEqual(
+            artifact_provider["enum"], ["gateway", "workspace"]
+        )
+        self.assertEqual(artifact_provider["default"], "gateway")
         accelerator = schema["accelerator"]
         physical_device_ids = accelerator["properties"]["physicalDeviceIDs"]
         self.assertEqual(physical_device_ids["x-kubernetes-list-type"], "set")

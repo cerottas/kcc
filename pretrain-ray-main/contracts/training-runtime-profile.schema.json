@@ -85,7 +85,8 @@
           "required": ["rankTableProvider", "healthProvider"],
           "properties": {
             "rankTableProvider": {"const": "clusterd"},
-            "healthProvider": {"enum": ["kubernetes", "npu-exporter"]}
+            "healthProvider": {"enum": ["kubernetes", "npu-exporter"]},
+            "artifactProvider": {"enum": ["gateway", "workspace"], "default": "gateway"}
           }
         },
         "podTemplate": {

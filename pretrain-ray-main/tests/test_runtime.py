@@ -39,7 +39,7 @@ def spec_document():
             "framework": "mindspeed", "command": ["python", "pretrain.py"],
             "workingDirectory": "/workspace/source", "environment": {}, "noProgressSeconds": 3600,
         },
-        "artifacts": {"source": "artifact://s", "model": "artifact://m", "data": "artifact://d", "outputRoot": "/workspace/runs/run-1"},
+        "artifacts": {"provider": "workspace", "source": "artifact://s", "model": "artifact://m", "data": "artifact://d", "outputRoot": "/workspace/runs/run-1"},
     }
 
 
@@ -50,6 +50,7 @@ class RuntimeTests(unittest.TestCase):
             path.write_text(json.dumps(spec_document()), encoding="utf-8")
             spec = RuntimeSpec.load(path)
             self.assertEqual(spec.command, ("python", "pretrain.py"))
+            self.assertEqual(spec.artifact_provider, "workspace")
 
     def test_spec_rejects_duplicate_topology(self):
         document = spec_document()
