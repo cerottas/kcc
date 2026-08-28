@@ -12,7 +12,8 @@ KCC Training 1.1 的唯一发布面是 `deploy/helm/kcc-training-stable`。包�
 - 制品：仅 `artifact://namespace/name/version`；
 - 镜像：生产配置必须使用 `@sha256`；
 - 工作目录：新 Recipe 使用相对于 source artifact 的路径；
-- 存储：共享 PVC，不使用 hostPath；
+- 存储：训练数据与状态使用共享 PVC；Ascend worker 只读挂载宿主机匹配版本的
+  `/usr/local/Ascend/driver`，不以 hostPath 保存训练数据或控制状态；
 - 控制状态：TrainingRun status 和 Lease，不依赖管理节点本地文件；
 - 可选物理卡固定：`accelerator.physicalDeviceIDs` 仅用于 `huawei.com/Ascend910`，
   数量必须等于 `devicesPerNode`，并渲染设备注解及物理/逻辑可见设备环境变量。

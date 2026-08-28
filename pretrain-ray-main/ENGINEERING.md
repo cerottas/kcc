@@ -18,7 +18,9 @@ RayCluster、ConfigMap、Lease、Ray submission ID 和 result ConfigMap 不是�
 
 - 命令始终使用字符串数组和 `shell=False`；
 - Kubernetes 访问使用 in-cluster API、resourceVersion 和 UID precondition；
-- 不使用 SSH、宿主机 kubeconfig、固定管理节点或 hostPath；
+- 不使用 SSH、宿主机 kubeconfig或固定管理节点；训练数据和控制状态不使用 hostPath；
+- Ascend worker 可只读挂载宿主机 `/usr/local/Ascend/driver`，以使用与设备匹配的
+  `hccn_tool` 和驱动库；
 - source/model/data/output 使用版本化 artifact URI 和共享 PVC；
 - 镜像及基础镜像以 digest 固定；
 - Recipe/Profile 不可变，attempt 的输入与拓扑可重放；

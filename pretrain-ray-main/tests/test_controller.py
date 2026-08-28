@@ -97,12 +97,12 @@ class ControllerTests(unittest.TestCase):
         self.jobs = FakeJobs()
         self.reconciler = Reconciler(self.api, self.jobs, runtime_service_account="runtime")
 
-    def test_pending_provisions_attempt_without_hostpath(self):
+    def test_pending_provisions_attempt_with_shared_workspace(self):
         self.assertEqual(self.reconciler.reconcile(self.run), "Starting")
         self.assertEqual(self.api.statuses[-1]["phase"], "Starting")
         rendered = str(self.api.upserts)
-        self.assertNotIn("hostPath", rendered)
         self.assertIn("persistentVolumeClaim", rendered)
+        self.assertIn("/usr/local/Ascend/driver", rendered)
 
     def test_ready_cluster_submits_once_and_moves_running(self):
         pending = self.reconciler.reconcile(self.run)

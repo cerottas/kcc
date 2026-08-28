@@ -252,6 +252,28 @@ def render_attempt(
         {"name": "ranktable", "mountPath": "/etc/kcc/ranktable", "readOnly": True},
         {"name": "workspace", "mountPath": profile.workspace_mount_path},
     ]
+    worker_volumes = list(shared_volumes)
+    worker_mounts = list(mounts)
+    if profile.resource_name == "huawei.com/Ascend910":
+        # The Ascend device plugin allocates devices, but this target cluster
+        # does not inject the host driver tools into the container. HCCL
+        # preflight and torch-npu both need the matching host driver tree.
+        worker_volumes.append(
+            {
+                "name": "ascend-driver",
+                "hostPath": {
+                    "path": "/usr/local/Ascend/driver",
+                    "type": "Directory",
+                },
+            }
+        )
+        worker_mounts.append(
+            {
+                "name": "ascend-driver",
+                "mountPath": "/usr/local/Ascend/driver",
+                "readOnly": True,
+            }
+        )
     cluster = {
         "apiVersion": "ray.io/v1",
         "kind": "RayCluster",
@@ -333,10 +355,10 @@ def render_attempt(
                                     "imagePullPolicy": "IfNotPresent",
                                     "resources": _worker_resources(profile),
                                     "env": worker_environment,
-                                    "volumeMounts": mounts,
+                                    "volumeMounts": worker_mounts,
                                 }
                             ],
-                            "volumes": shared_volumes,
+                            "volumes": worker_volumes,
                         },
                     },
                 }

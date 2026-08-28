@@ -34,13 +34,34 @@ class RayClusterTests(unittest.TestCase):
         self.assertTrue(first.endswith("-a12"))
         self.assertNotEqual(first, second)
 
-    def test_manifest_has_no_host_paths_or_kubeconfig(self) -> None:
+    def test_manifest_mounts_ascend_driver_without_kubeconfig(self) -> None:
         configmap, cluster = render_attempt(*objects(), attempt=0, active_nodes=("node-a", "node-b"), runtime_service_account="runtime")
         rendered = str((configmap, cluster))
-        self.assertNotIn("hostPath", rendered)
         self.assertNotIn("kubeconfig", rendered.lower())
-        volumes = cluster["spec"]["workerGroupSpecs"][0]["template"]["spec"]["volumes"]
+        worker = cluster["spec"]["workerGroupSpecs"][0]["template"]["spec"]
+        volumes = worker["volumes"]
         self.assertTrue(any("persistentVolumeClaim" in volume for volume in volumes))
+        self.assertIn(
+            {
+                "name": "ascend-driver",
+                "hostPath": {
+                    "path": "/usr/local/Ascend/driver",
+                    "type": "Directory",
+                },
+            },
+            volumes,
+        )
+        self.assertIn(
+            {
+                "name": "ascend-driver",
+                "mountPath": "/usr/local/Ascend/driver",
+                "readOnly": True,
+            },
+            worker["containers"][0]["volumeMounts"],
+        )
+        head_volumes = cluster["spec"]["headGroupSpec"]["template"]["spec"]["volumes"]
+        self.assertNotIn("hostPath", str(head_volumes))
+
 
     def test_attempt_mounts_owned_runtime_control(self) -> None:
         run, profile, recipe = objects()

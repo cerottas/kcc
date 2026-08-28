@@ -23,7 +23,8 @@ class FinalManifestTests(unittest.TestCase):
         self.assertEqual(runtime["training"]["environment"]["KCC_CHECKPOINT_ROOT"], runtime["artifacts"]["checkpointRoot"])
         init = cluster["spec"]["headGroupSpec"]["template"]["spec"]["initContainers"][0]
         self.assertEqual(init["command"], ["python", "-m", "kcc_training.runtime.materializer"])
-        self.assertNotIn("hostPath", str(cluster))
+        head_volumes = cluster["spec"]["headGroupSpec"]["template"]["spec"]["volumes"]
+        self.assertNotIn("hostPath", str(head_volumes))
 
     def test_gateway_is_mandatory(self):
         with patch.dict(os.environ, {}, clear=True):

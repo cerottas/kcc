@@ -741,10 +741,13 @@ def _run_stage(stage: Mapping[str, Any]) -> dict[str, Any]:
     try:
         payload = _parse_json_stdout(stdout, str(stage["name"]))
     except PipelineError as error:
+        failure = str(error)
+        if stderr_text:
+            failure = f"{failure}; stderr: {stderr_text[-4000:]}"
         record.update(
             {
                 "status": "FAIL",
-                "failure": str(error),
+                "failure": failure,
                 "stdout_excerpt": stdout_excerpt,
                 "stdout_truncated": stdout_truncated,
             }
