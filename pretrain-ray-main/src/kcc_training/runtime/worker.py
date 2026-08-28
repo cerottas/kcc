@@ -22,6 +22,32 @@ class WorkerError(RuntimeError):
     pass
 
 
+_FAILURE_SCOPES = {"hardware", "infrastructure", "network", "global-stall", "software"}
+_MAX_FAILURE_REPORT_BYTES = 4096
+
+
+def failure_scope_from_report(path: Path) -> str | None:
+    """Read an optional node-local failure hint emitted by the training process.
+
+    Hardware hints are not authoritative: the controller still requires stable
+    npu-exporter evidence before it replaces a node.
+    """
+    try:
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size > _MAX_FAILURE_REPORT_BYTES
+        ):
+            return None
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    if not isinstance(document, Mapping):
+        return None
+    scope = document.get("failureScope")
+    return scope if isinstance(scope, str) and scope in _FAILURE_SCOPES else None
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -124,6 +150,7 @@ class StructuredWorker:
         rank_log.mkdir(parents=True, exist_ok=False)
         stdout_path = rank_log / "stdout.log"
         stderr_path = rank_log / "stderr.log"
+        failure_report_path = rank_log / "failure-report.json"
         argv = [
             sys.executable,
             "-m",
@@ -148,6 +175,7 @@ class StructuredWorker:
             "KCC_ATTEMPT_ROOT": attempt_root,
             "KCC_OUTPUT_ROOT": output_root,
             "KCC_CHECKPOINT_ROOT": checkpoint_root,
+            "KCC_FAILURE_REPORT_PATH": str(failure_report_path),
             "PYTHONUNBUFFERED": "1",
         }
         if resume_from is None:
@@ -204,12 +232,15 @@ class StructuredWorker:
             status = "NO_PROGRESS"
         else:
             status = "FAIL"
+        reported_failure_scope = failure_scope_from_report(failure_report_path)
         return {
             "status": status,
             "failureScope": (
                 None
                 if status in {"PASS", "STOPPED"}
-                else ("global-stall" if no_progress else "software")
+                else (
+                    "global-stall" if no_progress else (reported_failure_scope or "software")
+                )
             ),
             "stopReason": self.stop_reason,
             "nodeRank": node_rank,

@@ -412,6 +412,60 @@ class RuntimeTests(unittest.TestCase):
             captured["env"]["RANK_TABLE_FILE"],
             "/etc/kcc/ranktable/hccl.json",
         )
+        self.assertTrue(
+            captured["env"]["KCC_FAILURE_REPORT_PATH"].endswith(
+                "/logs/node-rank-1/failure-report.json"
+            )
+        )
+
+    def test_worker_uses_structured_hardware_failure_hint(self):
+        class FailedProcess:
+            pid = 12345
+
+            def poll(self):
+                return 1
+
+            def wait(self):
+                return 1
+
+        def start_process(_argv, **kwargs):
+            Path(kwargs["env"]["KCC_FAILURE_REPORT_PATH"]).write_text(
+                json.dumps({"failureScope": "hardware"}), encoding="utf-8"
+            )
+            return FailedProcess()
+
+        identity = {
+            "NODE_NAME": "node-a",
+            "POD_NAME": "worker-a",
+            "POD_IP": "10.0.0.2",
+            "HOST_IP": "10.0.0.1",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.dict(os.environ, identity), patch(
+                "kcc_training.runtime.worker.subprocess.Popen",
+                side_effect=start_process,
+            ), patch.object(StructuredWorker, "_terminate"):
+                outcome = StructuredWorker().run(
+                    node_rank=0,
+                    workers=2,
+                    devices=8,
+                    master_addr="10.0.0.3",
+                    master_port=29501,
+                    command=("python", "train.py"),
+                    cwd=str(root),
+                    environment={},
+                    ranktable="/etc/kcc/ranktable/hccl.json",
+                    log_root=str(root / "logs"),
+                    checkpoint_root="/workspace/checkpoints/run-1",
+                    output_root="/workspace/runs/run-1",
+                    attempt_root="/workspace/runs/run-1/attempt-00",
+                    attempt=0,
+                    resume_from=None,
+                    no_progress_seconds=0,
+                )
+        self.assertEqual(outcome["status"], "FAIL")
+        self.assertEqual(outcome["failureScope"], "hardware")
 
     def test_ping_setup_failure_is_infrastructure(self):
         payload = {
