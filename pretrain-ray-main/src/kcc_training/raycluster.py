@@ -222,6 +222,15 @@ def render_attempt(
                 {"name": "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES", "value": "1"},
             ]
         )
+    elif profile.resource_name == "huawei.com/Ascend910":
+        logical = ",".join(str(item) for item in range(profile.devices_per_node))
+        worker_environment.extend(
+            [
+                {"name": "ASCEND_VISIBLE_DEVICES", "value": logical},
+                {"name": "ASCEND_RT_VISIBLE_DEVICES", "value": logical},
+                {"name": "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES", "value": "1"},
+            ]
+        )
     spec = runtime_spec(run, profile, recipe, attempt=attempt, active_nodes=active_nodes)
     configmap = {
         "apiVersion": "v1",
@@ -367,6 +376,8 @@ def render_attempt(
     }
     head_pod = cluster["spec"]["headGroupSpec"]["template"]["spec"]
     worker_pod = cluster["spec"]["workerGroupSpecs"][0]["template"]["spec"]
+    if profile.resource_name == "huawei.com/Ascend910":
+        worker_pod["containers"][0]["securityContext"] = {"privileged": True}
     for pod in (head_pod, worker_pod):
         pod["securityContext"] = {"fsGroup": 1000, "fsGroupChangePolicy": "OnRootMismatch"}
         if profile.image_pull_secrets:

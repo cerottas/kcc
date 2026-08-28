@@ -195,6 +195,8 @@ def run_hccl_gate(spec: RuntimeSpec, attempt_root: Path) -> Mapping[str, Any]:
         "auto",
         "--resource",
         "NPU",
+        "--device-ids",
+        ",".join(str(item) for item in range(spec.devices_per_node)),
         "--rank-table-path",
         str(spec.ranktable_path),
         "--probe-binary",

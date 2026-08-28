@@ -253,6 +253,8 @@ class RuntimeTests(unittest.TestCase):
             "/opt/kcc-hccl/bin/ranktable_allreduce_probe",
         )
 
+        device_ids_index = command.index("--device-ids") + 1
+        self.assertEqual(command[device_ids_index], "0,1,2,3,4,5,6,7")
     def test_failure_before_first_checkpoint_is_retryable_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             spec = SimpleNamespace(

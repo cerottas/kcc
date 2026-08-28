@@ -61,6 +61,7 @@ class RayClusterTests(unittest.TestCase):
         )
         head_volumes = cluster["spec"]["headGroupSpec"]["template"]["spec"]["volumes"]
         self.assertNotIn("hostPath", str(head_volumes))
+        self.assertTrue(worker["containers"][0]["securityContext"]["privileged"])
 
 
     def test_attempt_mounts_owned_runtime_control(self) -> None:

@@ -365,6 +365,9 @@ def parse_hccn_ip(output: str) -> str:
 
 
 def detect_local_device_ids() -> list[int]:
+    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if visible:
+        return parse_visible_device_ids(visible, "ASCEND_RT_VISIBLE_DEVICES")
     device_ids: list[int] = []
     for path in glob.glob("/dev/davinci[0-9]*"):
         match = _DAVINCI_RE.fullmatch(path)

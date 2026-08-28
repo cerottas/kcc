@@ -19,7 +19,15 @@ class FinalManifestTests(unittest.TestCase):
         self.assertTrue(source_target.startswith("/workspace/.kcc/artifacts/source/"))
         self.assertEqual(runtime["training"]["workingDirectory"], source_target)
         worker_env = cluster["spec"]["workerGroupSpecs"][0]["template"]["spec"]["containers"][0]["env"]
-        self.assertEqual({item["name"] for item in worker_env}, {"NODE_NAME", "POD_NAME", "POD_IP", "HOST_IP"})
+        self.assertEqual(
+            {item["name"] for item in worker_env},
+            {
+                "NODE_NAME", "POD_NAME", "POD_IP", "HOST_IP",
+                "ASCEND_VISIBLE_DEVICES",
+                "ASCEND_RT_VISIBLE_DEVICES",
+                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
+            },
+        )
         self.assertEqual(runtime["training"]["environment"]["KCC_CHECKPOINT_ROOT"], runtime["artifacts"]["checkpointRoot"])
         init = cluster["spec"]["headGroupSpec"]["template"]["spec"]["initContainers"][0]
         self.assertEqual(init["command"], ["python", "-m", "kcc_training.runtime.materializer"])
