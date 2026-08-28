@@ -554,7 +554,6 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                 node
                 for node in ray.nodes()
                 if node.get("Alive")
-                and node.get("Resources", {}).get("trainctl_worker", 0) >= 1
                 and node.get("Resources", {}).get("NPU", 0) >= spec.devices_per_node
             ]
             if len(candidates) != spec.workers:
@@ -570,7 +569,7 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             for node in candidates:
                 actors.append(
                     remote.options(
-                        resources={"trainctl_worker": 1, "NPU": spec.devices_per_node},
+                        resources={"NPU": spec.devices_per_node},
                         scheduling_strategy=NodeAffinitySchedulingStrategy(
                             node["NodeID"], soft=False
                         ),
