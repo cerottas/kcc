@@ -737,7 +737,7 @@ class Reconciler:
         self.jobs.submit_once(
             address,
             submission,
-            recipe.command,
+            (*recipe.command, *run.command_arguments),
             metadata={"runUid": run.identity.uid, "attempt": str(attempt)},
         )
         self._write_status(

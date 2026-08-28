@@ -104,7 +104,10 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("persistentVolumeClaim", rendered)
         self.assertIn("/usr/local/Ascend/driver", rendered)
 
-    def test_ready_cluster_submits_once_and_moves_running(self):
+    def test_ready_cluster_submits_effective_command_and_moves_running(self):
+        self.run["spec"]["training"] = {
+            "arguments": ["--micro-batch-size", "2"]
+        }
         pending = self.reconciler.reconcile(self.run)
         self.assertEqual(pending, "Starting")
         status = self.api.statuses[-1]
@@ -113,6 +116,10 @@ class ControllerTests(unittest.TestCase):
         current = with_status(self.run, status)
         self.assertEqual(self.reconciler.reconcile(current), "Running")
         self.assertEqual(len(self.jobs.submissions), 1)
+        self.assertEqual(
+            self.jobs.submissions[0][2],
+            ("python", "pretrain.py", "--micro-batch-size", "2"),
+        )
 
     def test_success_requires_owned_result_configmap(self):
         status = {
