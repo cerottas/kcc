@@ -222,7 +222,15 @@ class ApiV1Beta1Tests(unittest.TestCase):
                         "activeNodes": ["node-b", "node-c"],
                         "spareNodes": ["node-a"],
                     },
+                    "runtime": {
+                        "devicesPerNode": 4,
+                        "images": {
+                            "head": "registry.example/ray/head:custom@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "worker": "registry.example/ray/worker:custom@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        },
+                    },
                     "training": {
+                        "command": ["python", "custom_train.py"],
                         "arguments": ["--micro-batch-size", "2"],
                         "environment": {"CUSTOM_FLAG": "enabled"},
                         "artifacts": {
@@ -240,10 +248,20 @@ class ApiV1Beta1Tests(unittest.TestCase):
         )
         self.assertEqual(run.active_nodes, ("node-b", "node-c"))
         self.assertEqual(run.spare_nodes, ("node-a",))
+        self.assertEqual(run.command, ("python", "custom_train.py"))
         self.assertEqual(run.command_arguments, ("--micro-batch-size", "2"))
         self.assertEqual(run.environment, {"CUSTOM_FLAG": "enabled"})
         self.assertEqual(run.source_uri, "artifact://training/source/v2")
         self.assertEqual(run.output_subpath, "runs/custom")
+        self.assertEqual(run.devices_per_node, 4)
+        self.assertEqual(
+            run.head_image,
+            "registry.example/ray/head:custom@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        self.assertEqual(
+            run.worker_image,
+            "registry.example/ray/worker:custom@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
 
     def test_run_rejects_invalid_selected_topology(self) -> None:
         document = resource(

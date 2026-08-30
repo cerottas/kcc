@@ -159,7 +159,7 @@ def runtime_spec(
         },
         "training": {
             "framework": recipe.framework,
-            "command": [*recipe.command, *run.command_arguments],
+            "command": [*(run.command or recipe.command), *run.command_arguments],
             "workingDirectory": working_directory,
             "environment": environment,
             "noProgressSeconds": run.no_progress_seconds,
@@ -398,4 +398,3 @@ def render_attempt(
     if profile.runtime_class_name is None:
         worker_pod.pop("runtimeClassName", None)
     return configmap, cluster
-

@@ -194,6 +194,7 @@ class RayClusterTests(unittest.TestCase):
         run, profile, recipe = objects()
         run = replace(
             run,
+            command=("python", "custom_train.py"),
             command_arguments=("--micro-batch-size", "2"),
             environment={"CUSTOM_FLAG": "enabled"},
             source_uri="artifact://training/source/v2",
@@ -211,7 +212,7 @@ class RayClusterTests(unittest.TestCase):
         runtime = json.loads(configmap["data"]["run.json"])
         self.assertEqual(
             runtime["training"]["command"],
-            ["python", "pretrain.py", "--micro-batch-size", "2"],
+            ["python", "custom_train.py", "--micro-batch-size", "2"],
         )
         self.assertEqual(runtime["training"]["environment"]["CUSTOM_FLAG"], "enabled")
         self.assertEqual(

@@ -389,12 +389,16 @@ class Run:
     suspend_mode: str
     active_nodes: tuple[str, ...] = ()
     spare_nodes: tuple[str, ...] = ()
+    command: tuple[str, ...] | None = None
     command_arguments: tuple[str, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict)
     source_uri: str | None = None
     model_uri: str | None = None
     data_uri: str | None = None
     output_subpath: str | None = None
+    head_image: str | None = None
+    worker_image: str | None = None
+    devices_per_node: int | None = None
 
     @classmethod
     def from_resource(cls, document: Mapping[str, Any]) -> "Run":
@@ -404,7 +408,7 @@ class Run:
             spec,
             {"runtimeProfile", "recipe", "workers", "recovery"},
             "spec",
-            optional={"suspend", "suspendMode", "nodeSelection", "training"},
+            optional={"suspend", "suspendMode", "nodeSelection", "runtime", "training"},
         )
         recovery = mapping(spec["recovery"], "spec.recovery")
         exact(recovery, {"sameTopologyRetries", "maxReplacements", "noProgressSeconds"}, "spec.recovery")
@@ -436,8 +440,35 @@ class Run:
         if node_selection and max_replacements > len(spare_nodes):
             raise ApiValidationError("maxReplacements exceeds selected spareNodes")
 
+        runtime = mapping(spec.get("runtime", {}), "spec.runtime")
+        exact(runtime, set(), "spec.runtime", optional={"devicesPerNode", "images"})
+        runtime_images = mapping(runtime.get("images", {}), "spec.runtime.images")
+        exact(runtime_images, set(), "spec.runtime.images", optional={"head", "worker"})
+        devices_per_node = (
+            positive(runtime["devicesPerNode"], "spec.runtime.devicesPerNode", maximum=64)
+            if "devicesPerNode" in runtime
+            else None
+        )
+
         training = mapping(spec.get("training", {}), "spec.training")
-        exact(training, set(), "spec.training", optional={"arguments", "environment", "artifacts"})
+        exact(
+            training,
+            set(),
+            "spec.training",
+            optional={"command", "arguments", "environment", "artifacts"},
+        )
+        raw_command = training.get("command")
+        command = None
+        if raw_command is not None:
+            if not isinstance(raw_command, list) or not raw_command:
+                raise ApiValidationError("spec.training.command must be a non-empty list")
+            command = tuple(
+                text(item, "spec.training.command item") for item in raw_command
+            )
+            if len(command) > 128 or any(len(item) > 4096 for item in command):
+                raise ApiValidationError(
+                    "spec.training.command permits 128 entries of at most 4096 characters"
+                )
         raw_arguments = training.get("arguments", [])
         if not isinstance(raw_arguments, list):
             raise ApiValidationError("spec.training.arguments must be a list")
@@ -477,11 +508,22 @@ class Run:
             suspend_mode=suspend_mode,
             active_nodes=active_nodes,
             spare_nodes=spare_nodes,
+            command=command,
             command_arguments=command_arguments,
             environment=environment,
             source_uri=(artifact_uri(artifacts["source"], "spec.training.artifacts.source") if "source" in artifacts else None),
             model_uri=(artifact_uri(artifacts["model"], "spec.training.artifacts.model") if "model" in artifacts else None),
             data_uri=(artifact_uri(artifacts["data"], "spec.training.artifacts.data") if "data" in artifacts else None),
             output_subpath=output_subpath,
+            head_image=(
+                image(runtime_images["head"], "spec.runtime.images.head")
+                if "head" in runtime_images
+                else None
+            ),
+            worker_image=(
+                image(runtime_images["worker"], "spec.runtime.images.worker")
+                if "worker" in runtime_images
+                else None
+            ),
+            devices_per_node=devices_per_node,
         )
-

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import os
@@ -274,6 +275,20 @@ class Reconciler:
         try:
             profile = self.profile_loader(
                 self._resource(run.identity.namespace, "trainingruntimeprofiles", run.profile_name)
+            )
+            if (
+                run.devices_per_node is not None
+                and profile.physical_device_ids
+                and run.devices_per_node != profile.devices_per_node
+            ):
+                raise ControllerError(
+                    "devicesPerNode cannot override a profile with fixed physicalDeviceIDs"
+                )
+            profile = replace(
+                profile,
+                head_image=run.head_image or profile.head_image,
+                worker_image=run.worker_image or profile.worker_image,
+                devices_per_node=run.devices_per_node or profile.devices_per_node,
             )
             recipe = self.recipe_loader(
                 self._resource(run.identity.namespace, "trainingrecipes", run.recipe_name)
@@ -737,7 +752,7 @@ class Reconciler:
         self.jobs.submit_once(
             address,
             submission,
-            (*recipe.command, *run.command_arguments),
+            (*(run.command or recipe.command), *run.command_arguments),
             metadata={"runUid": run.identity.uid, "attempt": str(attempt)},
         )
         self._write_status(
