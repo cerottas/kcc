@@ -28,6 +28,8 @@ COPY --from=builder /opt/wheels /opt/wheels
 RUN python -m pip install \
       --no-cache-dir \
       --no-index \
+      --no-deps \
+      --force-reinstall \
       --find-links=/opt/wheels \
       "kcc-training==${VERSION}" \
     && python -m compileall -q /usr/local/lib/python*/site-packages/kcc_training \
@@ -38,4 +40,3 @@ ENV PYTHONUNBUFFERED=1 \
     HEALTH_PORT=8080
 USER 65532:65532
 ENTRYPOINT ["python", "-m", "kcc_training.controller_stable"]
-
