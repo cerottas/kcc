@@ -15,7 +15,7 @@ from kcc_training.artifact_publish import publish_directory
 from kcc_training.artifacts import ArtifactError, ArtifactGateway
 
 from .checkpoints import CheckpointError, CheckpointUnavailable, snapshot
-from .coordinator import _publish, execute, failure_result
+from .coordinator import _publish, execute, failure_result, publish_progress
 from .spec import RuntimeSpec
 
 
@@ -295,6 +295,24 @@ def main(
             spec,
             error,
             scope="artifact" if isinstance(error, ArtifactError) else None,
+        )
+    if spec is not None:
+        final_status = str(result.get("status", "FAIL"))
+        publish_progress(
+            spec,
+            "Completed" if final_status == "PASS" else "Failed",
+            "Passed" if final_status == "PASS" else final_status.title(),
+            (
+                "training output is ready"
+                if final_status == "PASS"
+                else str(result.get("failure") or f"runtime finished with {final_status}")
+            ),
+            outputArtifact=result.get("outputArtifact"),
+            checkpointIteration=(
+                result.get("checkpoint", {}).get("iteration")
+                if isinstance(result.get("checkpoint"), Mapping)
+                else None
+            ),
         )
     try:
         _publish(result)

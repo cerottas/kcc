@@ -324,6 +324,30 @@ class RuntimeTests(unittest.TestCase):
             ],
         )
 
+    def test_progress_is_printed_and_published_as_owned_configmap(self):
+        spec = SimpleNamespace(
+            run_name="run-1",
+            namespace="training",
+            run_uid="uid-1",
+            attempt=2,
+        )
+        with patch.object(coordinator_module, "KubernetesApi") as api_type, patch(
+            "builtins.print"
+        ) as output:
+            coordinator_module.publish_progress(
+                spec,
+                "Training",
+                "Running",
+                "distributed training is running",
+                checkpointIteration=12,
+            )
+        document = api_type.return_value.upsert.call_args.args[2]
+        progress = json.loads(document["data"]["progress.json"])
+        self.assertEqual(document["metadata"]["name"], "run-1-a02-progress")
+        self.assertEqual(progress["stage"], "Training")
+        self.assertEqual(progress["details"]["checkpointIteration"], 12)
+        self.assertTrue(output.call_args.args[0].startswith("KCC_PROGRESS "))
+
     def test_runtime_exception_after_spec_load_is_published(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.json"

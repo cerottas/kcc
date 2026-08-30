@@ -179,6 +179,20 @@ spec:
                 outputArtifact:
                   type: string
                   pattern: '^artifact://[^/?#\s]+/[^/?#\s]+/[^/?#\s]+$'
+                progress:
+                  type: object
+                  properties:
+                    schemaVersion: {type: string}
+                    runName: {type: string}
+                    runUid: {type: string}
+                    attempt: {type: integer, minimum: 0}
+                    stage: {type: string}
+                    status: {type: string}
+                    message: {type: string}
+                    updatedAt: {type: string}
+                    details:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                 checkpoint:
                   type: object
                   nullable: true

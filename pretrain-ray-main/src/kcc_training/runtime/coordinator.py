@@ -12,10 +12,11 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
-from kcc_training.kube_api import KubernetesApi, core_namespaced_path
+from kcc_training.kube_api import KubernetesApi, core_namespaced_path, utc_now
 from kcc_training.raycluster import CONTROL_SCHEMA, attempt_name
 
 from .checkpoints import (
+    TRACKER,
     CheckpointError,
     CheckpointUnavailable,
     require_consistent,
@@ -28,6 +29,70 @@ from .worker import StructuredWorker
 DEFAULT_PROBE_BINARY = "/opt/kcc-hccl/bin/ranktable_allreduce_probe"
 CONTROL_FILE = Path("/etc/kcc/control/control.json")
 MAX_CONTROL_BYTES = 64 * 1024
+PROGRESS_SCHEMA = "kcc-runtime-progress/v1"
+
+
+def publish_progress(
+    spec: RuntimeSpec,
+    stage: str,
+    status: str,
+    message: str,
+    **details: Any,
+) -> None:
+    """Emit human-visible progress and publish the latest structured stage."""
+    progress = {
+        "schemaVersion": PROGRESS_SCHEMA,
+        "runName": spec.run_name,
+        "runUid": spec.run_uid,
+        "attempt": spec.attempt,
+        "stage": stage,
+        "status": status,
+        "message": message,
+        "updatedAt": utc_now(),
+        "details": details,
+    }
+    print(
+        "KCC_PROGRESS " + json.dumps(progress, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
+    cluster_name = attempt_name(spec.run_name, spec.attempt)
+    name = f"{cluster_name}-progress"
+    document = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": name,
+            "namespace": spec.namespace,
+            "labels": {"training.kcc.io/run": spec.run_name},
+            "annotations": {
+                "training.kcc.io/run-uid": spec.run_uid,
+                "training.kcc.io/attempt": str(spec.attempt),
+            },
+            "ownerReferences": [
+                {
+                    "apiVersion": "training.kcc.io/v1beta1",
+                    "kind": "TrainingRun",
+                    "name": spec.run_name,
+                    "uid": spec.run_uid,
+                    "controller": False,
+                    "blockOwnerDeletion": False,
+                }
+            ],
+        },
+        "data": {
+            "progress.json": json.dumps(
+                progress, ensure_ascii=False, sort_keys=True, default=str
+            )
+        },
+    }
+    try:
+        KubernetesApi().upsert(
+            core_namespaced_path(spec.namespace, "configmaps"),
+            core_namespaced_path(spec.namespace, "configmaps", name),
+            document,
+        )
+    except Exception as error:
+        print(f"KCC_PROGRESS publish warning: {error}", file=sys.stderr, flush=True)
 
 
 class CoordinatorError(RuntimeError):
@@ -523,9 +588,35 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
     log_root = attempt_root / "training"
     log_root.mkdir()
 
+    publish_progress(
+        spec,
+        "CoordinatorStarting",
+        "Running",
+        "training coordinator started",
+        workers=spec.workers,
+        devicesPerNode=spec.devices_per_node,
+    )
+
     # The pipeline owns RankTable preparation.  Waiting before it runs creates
     # a producer/consumer deadlock on a fresh attempt.
+    hccl_started = time.monotonic()
+    publish_progress(
+        spec,
+        "HcclTest",
+        "Running",
+        "discovering workers, generating RankTable, and running HCCL AllReduce",
+        expectedWorkers=spec.workers,
+        expectedRanks=spec.workers * spec.devices_per_node,
+    )
     hccl_result = run_hccl_gate(spec, attempt_root)
+    publish_progress(
+        spec,
+        "HcclTest",
+        "Passed",
+        "HCCL AllReduce passed on every rank",
+        durationSeconds=round(time.monotonic() - hccl_started, 3),
+        rankTableSha256=hccl_result.get("ranktable_sha256"),
+    )
     raw_projection_timeout = os.environ.get(
         "KCC_RANKTABLE_PROJECTION_TIMEOUT_SECONDS", "120"
     )
@@ -543,7 +634,16 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
     if hccl_result.get("ranktable_sha256") != ranktable_sha256:
         raise CoordinatorError("projected RankTable differs from HCCL evidence")
     node_ranks = _node_ranks_from_hccl(hccl_result, spec)
+    publish_progress(
+        spec,
+        "RankTable",
+        "Passed",
+        "projected RankTable matches HCCL evidence",
+        rankTableSha256=ranktable_sha256,
+        nodeRanks=node_ranks,
+    )
 
+    publish_progress(spec, "RayWorkers", "Running", "connecting to Ray workers")
     try:
         ray.init(address="auto", log_to_driver=False)
     except Exception as error:
@@ -601,6 +701,19 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             for node in spec.nodes
         )
         master_addr = ordered[0][3]["POD_IP"]
+        publish_progress(
+            spec,
+            "RayWorkers",
+            "Passed",
+            "all Ray worker actors are bound to the selected nodes",
+            nodes=[item[1] for item in ordered],
+        )
+        publish_progress(
+            spec,
+            "WorkerPreflight",
+            "Running",
+            "checking source, RankTable, and NPU devices on every worker",
+        )
         try:
             preflights = list(
                 ray.get(
@@ -619,6 +732,13 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             )
         except Exception as error:
             raise CoordinatorError(f"worker preflight failed: {error}") from error
+        publish_progress(
+            spec,
+            "WorkerPreflight",
+            "Passed",
+            "worker preflight passed",
+            passedWorkers=len(preflights),
+        )
 
         resume_checkpoint: Mapping[str, Any] | None = None
         if spec.attempt > 0:
@@ -673,7 +793,40 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
 
         outcomes: list[Mapping[str, Any]] = []
         failure = False
+        training_started = time.monotonic()
+        last_progress_report = 0.0
+        publish_progress(
+            spec,
+            "Training",
+            "Running",
+            "distributed training processes launched",
+            command=list(spec.command),
+            totalWorkers=spec.workers,
+            resumeFrom=resume_from,
+        )
         while pending:
+            now = time.monotonic()
+            if now - last_progress_report >= 10:
+                last_progress_report = now
+                checkpoint_iteration: int | None = None
+                tracker = spec.checkpoint_root / TRACKER
+                try:
+                    if tracker.is_file():
+                        checkpoint_iteration = int(
+                            tracker.read_text(encoding="utf-8").strip()
+                        )
+                except (OSError, UnicodeError, ValueError):
+                    checkpoint_iteration = None
+                publish_progress(
+                    spec,
+                    "Training",
+                    "Running",
+                    "distributed training is running",
+                    elapsedSeconds=round(now - training_started, 1),
+                    completedWorkers=len(outcomes),
+                    remainingWorkers=len(pending),
+                    checkpointIteration=checkpoint_iteration,
+                )
 
             request = load_runtime_control(control_path, spec)
             if not stop_issued and request is not None:
@@ -777,6 +930,17 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                     "nodeRank": node_rank,
                 }
             outcomes.append(outcome)
+            publish_progress(
+                spec,
+                "Training",
+                "Running" if pending else "Passed",
+                f"worker {identity['NODE_NAME']} finished with {outcome.get('status')}",
+                completedWorkers=len(outcomes),
+                remainingWorkers=len(pending),
+                nodeName=identity["NODE_NAME"],
+                nodeRank=node_rank,
+                workerStatus=outcome.get("status"),
+            )
             if outcome.get("status") not in {"PASS", "STOPPED"} and not failure:
                 failure = True
                 try:
@@ -866,6 +1030,16 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             )
         if checkpoint_error is not None:
             result["checkpointFailure"] = str(checkpoint_error)
+        publish_progress(
+            spec,
+            "Training",
+            "Passed" if status == "PASS" else status.title(),
+            f"distributed training finished with {status}",
+            completedWorkers=len(outcomes),
+            checkpointIteration=(
+                checkpoint.get("iteration") if isinstance(checkpoint, Mapping) else None
+            ),
+        )
         return result
     finally:
         for actor in actors:

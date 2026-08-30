@@ -150,6 +150,53 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.reconciler.reconcile(with_status(self.run, status)), "Running")
         self.assertEqual(self.api.statuses[-1]["conditions"][0]["reason"], "RuntimeResultPending")
 
+    def test_running_mirrors_owned_runtime_progress(self):
+        status = {
+            "phase": "Running", "attempt": 0,
+            "activeNodes": ["node-a", "node-b"], "spareNodes": ["node-c"],
+            "clusterName": "run-1-a00", "retriesUsed": 0, "replacementsUsed": 0,
+            "rayAddress": "http://ray", "submissionId": "run-1-a00",
+        }
+        cluster_path = namespaced_path(
+            "ray.io", "v1", "training", "rayclusters", "run-1-a00"
+        )
+        self.api.objects[cluster_path] = {
+            "metadata": {
+                "uid": "cluster-uid",
+                "annotations": {"training.kcc.io/run-uid": "uid-1"},
+            }
+        }
+        progress = {
+            "schemaVersion": "kcc-runtime-progress/v1",
+            "runName": "run-1",
+            "runUid": "uid-1",
+            "attempt": 0,
+            "stage": "HcclTest",
+            "status": "Running",
+            "message": "running HCCL AllReduce",
+            "updatedAt": "2026-08-30T12:00:00Z",
+            "details": {"expectedRanks": 16},
+        }
+        progress_path = core_namespaced_path(
+            "training", "configmaps", "run-1-a00-progress"
+        )
+        self.api.objects[progress_path] = {
+            "metadata": {
+                "annotations": {
+                    "training.kcc.io/run-uid": "uid-1",
+                    "training.kcc.io/attempt": "0",
+                }
+            },
+            "data": {"progress.json": json.dumps(progress)},
+        }
+        self.assertEqual(
+            self.reconciler.reconcile(with_status(self.run, status)), "Running"
+        )
+        self.assertEqual(self.api.statuses[-1]["progress"], progress)
+        self.assertEqual(
+            self.api.statuses[-1]["conditions"][0]["reason"], "RuntimeProgress"
+        )
+
 
     def test_suspend_after_checkpoint_waits_for_verified_runtime_result(self):
         status = {

@@ -23,6 +23,7 @@ GROUP = "training.kcc.io"
 VERSION = "v1beta1"
 TERMINAL = {"Succeeded", "Stopped", "ManualRequired"}
 _PERMANENT_HTTP_STATUS = {400, 401, 403, 409, 422}
+PROGRESS_SCHEMA = "kcc-runtime-progress/v1"
 
 
 class HealthProvider(Protocol):
@@ -147,6 +148,46 @@ def _trusted_result(document: Mapping[str, Any] | None, run: Run, attempt: int) 
     ):
         raise ControllerError("runtime failure evidence is invalid")
     return value
+
+
+def _trusted_progress(
+    document: Mapping[str, Any] | None,
+    run: Run,
+    attempt: int,
+) -> Mapping[str, Any] | None:
+    if document is None:
+        return None
+    metadata = document.get("metadata")
+    data = document.get("data")
+    if not isinstance(metadata, Mapping) or not isinstance(data, Mapping):
+        return None
+    annotations = metadata.get("annotations")
+    if (
+        not isinstance(annotations, Mapping)
+        or annotations.get("training.kcc.io/run-uid") != run.identity.uid
+        or annotations.get("training.kcc.io/attempt") != str(attempt)
+    ):
+        return None
+    raw = data.get("progress.json")
+    if not isinstance(raw, str) or len(raw.encode()) > 128 * 1024:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schemaVersion") != PROGRESS_SCHEMA
+        or value.get("runName") != run.identity.name
+        or value.get("runUid") != run.identity.uid
+        or value.get("attempt") != attempt
+        or not isinstance(value.get("stage"), str)
+        or not isinstance(value.get("status"), str)
+        or not isinstance(value.get("message"), str)
+        or not isinstance(value.get("updatedAt"), str)
+    ):
+        return None
+    return dict(value)
 
 
 class Reconciler:
@@ -468,6 +509,34 @@ class Reconciler:
         if self.api.get(cluster_path) is None:
             raise ControllerError("RayCluster disappeared during checkpoint stop")
         result_name = f"{cluster_name}-result"
+        progress = _trusted_progress(
+            self.api.get(
+                core_namespaced_path(
+                    run.identity.namespace,
+                    "configmaps",
+                    f"{cluster_name}-progress",
+                )
+            ),
+            run,
+            attempt,
+        )
+        if progress is not None and progress != current.get("progress"):
+            self._write_status(
+                resource,
+                _status(
+                    resource,
+                    progress=progress,
+                    conditions=[
+                        _condition(
+                            "Ready",
+                            "False",
+                            "RuntimeProgress",
+                            f"{progress['stage']}: {progress['message']}",
+                        )
+                    ],
+                ),
+            )
+            return "Stopping"
         result = self.result_validator(
             self.api.get(
                 core_namespaced_path(
@@ -794,6 +863,34 @@ class Reconciler:
         if not isinstance(address, str) or not address or not isinstance(submission, str) or not submission:
             raise ControllerError("running status lacks Ray job identity")
         result_name = f"{cluster_name}-result"
+        progress = _trusted_progress(
+            self.api.get(
+                core_namespaced_path(
+                    run.identity.namespace,
+                    "configmaps",
+                    f"{cluster_name}-progress",
+                )
+            ),
+            run,
+            attempt,
+        )
+        if progress is not None and progress != current.get("progress"):
+            self._write_status(
+                resource,
+                _status(
+                    resource,
+                    progress=progress,
+                    conditions=[
+                        _condition(
+                            "Ready",
+                            "False",
+                            "RuntimeProgress",
+                            f"{progress['stage']}: {progress['message']}",
+                        )
+                    ],
+                ),
+            )
+            return "Running"
         result = self.result_validator(
             self.api.get(core_namespaced_path(run.identity.namespace, "configmaps", result_name)),
             run,
