@@ -14,6 +14,7 @@ from .checkpoints import (
     MAX_TRACKER_BYTES,
     TRACKER,
     CheckpointUnavailable,
+    discard_uncommitted,
     snapshot,
 )
 
@@ -125,6 +126,16 @@ class StructuredWorker:
         except CheckpointUnavailable:
             return {"available": False, "nodeName": node_name}
         return {**report, "nodeName": node_name}
+
+    def discard_uncommitted_checkpoints(
+        self,
+        checkpoint_root: str,
+        keep_iteration: int | None,
+    ) -> Mapping[str, Any]:
+        return {
+            **discard_uncommitted(Path(checkpoint_root), keep_iteration),
+            "nodeName": self.identity()["NODE_NAME"],
+        }
 
     def run(
         self,
@@ -255,4 +266,3 @@ class StructuredWorker:
         self.stop_reason = reason
         if self.process is not None:
             self._terminate(self.process)
-

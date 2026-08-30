@@ -12,7 +12,7 @@ from .api_v1beta1 import Recipe, Run, RuntimeProfile
 KUBERAY_HEAD_SERVICE_SUFFIX = "-head-svc"
 MAX_RAYCLUSTER_NAME_LENGTH = 63 - len(KUBERAY_HEAD_SERVICE_SUFFIX)
 CONTROL_SCHEMA = "kcc-runtime-control/v1"
-CONTROL_ACTIONS = {"Continue", "StopAfterCheckpoint"}
+CONTROL_ACTIONS = {"Continue", "StopAfterCheckpoint", "StopImmediate"}
 CONTROL_MOUNT_PATH = "/etc/kcc/control"
 
 

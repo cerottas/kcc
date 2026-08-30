@@ -10,6 +10,7 @@ from kcc_training.runtime import coordinator as coordinator_module
 from kcc_training.runtime.checkpoints import (
     CheckpointError,
     CheckpointUnavailable,
+    discard_uncommitted,
     require_consistent,
     snapshot,
 )
@@ -78,6 +79,37 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(CheckpointError, "different"):
             require_consistent([{"snapshotSha256": "a"}, {"snapshotSha256": "b"}], 2)
 
+    def test_immediate_stop_discards_new_checkpoints_and_retains_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "checkpoints"
+            for iteration in (7, 8, 9):
+                target = root / f"iter_{iteration:07d}"
+                target.mkdir(parents=True)
+                (target / "model.pt").write_bytes(str(iteration).encode())
+            (root / "partial-upload").mkdir()
+            (root / "latest_checkpointed_iteration.txt").write_text(
+                "9\n", encoding="utf-8"
+            )
+            result = discard_uncommitted(root, 7)
+            self.assertEqual(result["retainedIteration"], 7)
+            self.assertTrue((root / "iter_0000007").is_dir())
+            self.assertFalse((root / "iter_0000008").exists())
+            self.assertFalse((root / "iter_0000009").exists())
+            self.assertFalse((root / "partial-upload").exists())
+            self.assertEqual(
+                (root / "latest_checkpointed_iteration.txt").read_text().strip(),
+                "7",
+            )
+
+    def test_immediate_stop_without_baseline_removes_checkpoint_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "checkpoints"
+            (root / "iter_0000001").mkdir(parents=True)
+            (root / "iter_0000001" / "model.pt").write_bytes(b"incomplete")
+            result = discard_uncommitted(root, None)
+            self.assertIsNone(result["retainedIteration"])
+            self.assertFalse(root.exists())
+
     def test_runtime_control_is_bound_to_run_attempt_and_generation(self):
         spec = SimpleNamespace(
             run_name="run-1",
@@ -99,6 +131,9 @@ class RuntimeTests(unittest.TestCase):
                 load_runtime_control(path, spec)["requestGeneration"],
                 2,
             )
+            payload["action"] = "StopImmediate"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(load_runtime_control(path, spec)["action"], "StopImmediate")
             payload["runUid"] = "other"
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(CoordinatorError, "identity"):

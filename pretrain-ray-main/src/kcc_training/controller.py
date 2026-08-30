@@ -116,28 +116,42 @@ def _trusted_result(document: Mapping[str, Any] | None, run: Run, attempt: int) 
     if value["status"] == "STOPPED":
         checkpoint = value.get("checkpoint")
         request_generation = value.get("stopRequestGeneration")
-        baseline = value.get("stopBaselineIteration")
-        iteration = (
-            checkpoint.get("iteration")
-            if isinstance(checkpoint, Mapping)
-            else None
-        )
+        stop_reason = value.get("stopReason")
         if (
-            value.get("stopReason") != "AfterCheckpoint"
-            or value.get("checkpointConsistent") is not True
-            or value.get("checkpointAvailable") is not True
-            or not isinstance(checkpoint, Mapping)
-            or isinstance(request_generation, bool)
+            isinstance(request_generation, bool)
             or not isinstance(request_generation, int)
             or request_generation < 1
-            or isinstance(baseline, bool)
-            or not isinstance(baseline, int)
-            or baseline < 0
-            or isinstance(iteration, bool)
-            or not isinstance(iteration, int)
-            or iteration <= baseline
         ):
-            raise ControllerError("runtime graceful-stop evidence is invalid")
+            raise ControllerError("runtime stop evidence generation is invalid")
+        if stop_reason == "AfterCheckpoint":
+            baseline = value.get("stopBaselineIteration")
+            iteration = (
+                checkpoint.get("iteration")
+                if isinstance(checkpoint, Mapping)
+                else None
+            )
+            if (
+                value.get("checkpointConsistent") is not True
+                or value.get("checkpointAvailable") is not True
+                or not isinstance(checkpoint, Mapping)
+                or isinstance(baseline, bool)
+                or not isinstance(baseline, int)
+                or baseline < 0
+                or isinstance(iteration, bool)
+                or not isinstance(iteration, int)
+                or iteration <= baseline
+            ):
+                raise ControllerError("runtime graceful-stop evidence is invalid")
+        elif stop_reason == "Immediate":
+            cleanup = value.get("checkpointCleanup")
+            if (
+                value.get("checkpointConsistent") is not True
+                or not isinstance(cleanup, Mapping)
+                or cleanup.get("completed") is not True
+            ):
+                raise ControllerError("runtime immediate-stop cleanup evidence is invalid")
+        else:
+            raise ControllerError("runtime stop reason is invalid")
 
     failed_nodes = value.get("failedNodes", [])
     failure_scope = value.get("failureScope")
@@ -368,11 +382,13 @@ class Reconciler:
             if not run.suspended:
                 return self._cancel_checkpoint_stop(resource, run, current)
             if run.suspend_mode == "Immediate":
-                return self._suspend(resource, run, current, phase)
+                return self._reconcile_immediate_stop(resource, run, current)
             return self._reconcile_checkpoint_stop(resource, run, current)
         if run.suspended:
             if run.suspend_mode == "AfterCheckpoint" and phase == "Running":
                 return self._request_checkpoint_stop(resource, run, current)
+            if run.suspend_mode == "Immediate" and phase == "Running":
+                return self._request_immediate_stop(resource, run, current)
             return self._suspend(resource, run, current, phase)
         if phase == "Suspended":
             return self._resume(resource, run, current)
@@ -452,6 +468,94 @@ class Reconciler:
             run.identity.generation,
         )
         return "Stopping"
+
+    def _request_immediate_stop(
+        self,
+        resource: Mapping[str, Any],
+        run: Run,
+        current: Mapping[str, Any],
+    ) -> str:
+        attempt = int(current.get("attempt", 0))
+        requested = _status(
+            resource,
+            phase="Stopping",
+            observedGeneration=run.identity.generation,
+            suspendedFrom="Running",
+            stopRequestGeneration=run.identity.generation,
+            conditions=[
+                _condition(
+                    "Ready",
+                    "False",
+                    "StoppingImmediate",
+                    "stopping workers and deleting checkpoints created by this attempt",
+                )
+            ],
+        )
+        self._write_status(resource, requested)
+        self._upsert_runtime_control(
+            run,
+            attempt,
+            "StopImmediate",
+            run.identity.generation,
+        )
+        return "Stopping"
+
+    def _reconcile_immediate_stop(
+        self,
+        resource: Mapping[str, Any],
+        run: Run,
+        current: Mapping[str, Any],
+    ) -> str:
+        if current.get("stopRequestGeneration") != run.identity.generation:
+            return self._request_immediate_stop(resource, run, current)
+        attempt = int(current.get("attempt", 0))
+        cluster_name = str(current.get("clusterName", ""))
+        if not cluster_name:
+            raise ControllerError("immediate-stop status lacks RayCluster identity")
+        self._upsert_runtime_control(
+            run,
+            attempt,
+            "StopImmediate",
+            run.identity.generation,
+        )
+        result = self.result_validator(
+            self.api.get(
+                core_namespaced_path(
+                    run.identity.namespace,
+                    "configmaps",
+                    f"{cluster_name}-result",
+                )
+            ),
+            run,
+            attempt,
+        )
+        if result is None:
+            return "Stopping"
+        if result.get("status") == "PASS":
+            condition_reason = "CompletedBeforeImmediateStop"
+            condition_message = "training completed before the immediate stop request"
+        elif result.get("status") == "STOPPED" and result.get("stopReason") == "Immediate":
+            cleanup = result.get("checkpointCleanup", {})
+            condition_reason = "SuspendedImmediate"
+            condition_message = (
+                "immediate stop completed; unapproved checkpoints were deleted "
+                f"(removed {cleanup.get('removedEntries', 0)})"
+            )
+        else:
+            raise ControllerError("runtime failed while processing immediate stop")
+        suspended = _status(
+            resource,
+            phase="Suspended",
+            observedGeneration=run.identity.generation,
+            suspendedFrom="Running",
+            checkpoint=result.get("checkpoint"),
+            conditions=[
+                _condition("Ready", "False", condition_reason, condition_message)
+            ],
+        )
+        self._write_status(resource, suspended)
+        self._cleanup_cluster(run, cluster_name)
+        return "Suspended"
 
     def _cancel_checkpoint_stop(
         self,

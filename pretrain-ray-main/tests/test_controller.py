@@ -346,10 +346,53 @@ class ControllerTests(unittest.TestCase):
             "metadata": {"uid": "cluster-uid", "annotations": {"training.kcc.io/run-uid": "uid-1"}}
         }
         suspended = json.loads(json.dumps(self.run))
+        suspended["metadata"]["generation"] = 2
         suspended["spec"]["suspend"] = True
-        self.assertEqual(self.reconciler.reconcile(with_status(suspended, status)), "Suspended")
+        self.assertEqual(self.reconciler.reconcile(with_status(suspended, status)), "Stopping")
+        stopping_status = self.api.statuses[-1]
+        control_path = core_namespaced_path(
+            "training", "configmaps", "run-1-a00-control"
+        )
+        control = json.loads(self.api.objects[control_path]["data"]["control.json"])
+        self.assertEqual(control["action"], "StopImmediate")
+        self.assertFalse(self.jobs.stops)
+        self.assertFalse(self.api.deletes)
+
+        result_path = core_namespaced_path(
+            "training", "configmaps", "run-1-a00-result"
+        )
+        result = {
+            "schemaVersion": "kcc-runtime-result/v1",
+            "runUid": "uid-1",
+            "attempt": 0,
+            "status": "STOPPED",
+            "checkpointConsistent": True,
+            "checkpointAvailable": False,
+            "checkpoint": None,
+            "failureScope": None,
+            "failedNodes": [],
+            "stopReason": "Immediate",
+            "stopRequestGeneration": 2,
+            "checkpointCleanup": {
+                "completed": True,
+                "removedEntries": 3,
+                "retainedIteration": None,
+            },
+        }
+        self.api.objects[result_path] = {
+            "metadata": {
+                "annotations": {
+                    "training.kcc.io/run-uid": "uid-1",
+                    "training.kcc.io/attempt": "0",
+                }
+            },
+            "data": {"result.json": json.dumps(result)},
+        }
+        self.assertEqual(
+            self.reconciler.reconcile(with_status(suspended, stopping_status)),
+            "Suspended",
+        )
         suspended_status = self.api.statuses[-1]
-        self.assertEqual(self.jobs.stops, [("http://ray", "run-1-a00")])
         self.assertEqual(len(self.api.deletes), 1)
 
         self.assertEqual(

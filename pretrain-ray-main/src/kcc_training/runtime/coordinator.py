@@ -19,6 +19,7 @@ from .checkpoints import (
     TRACKER,
     CheckpointError,
     CheckpointUnavailable,
+    discard_uncommitted,
     require_consistent,
     snapshot,
 )
@@ -126,7 +127,7 @@ def load_runtime_control(path: Path, spec: RuntimeSpec) -> Mapping[str, Any] | N
         or value.get("runName") != spec.run_name
         or value.get("runUid") != spec.run_uid
         or value.get("attempt") != spec.attempt
-        or value.get("action") not in {"Continue", "StopAfterCheckpoint"}
+        or value.get("action") not in {"Continue", "StopAfterCheckpoint", "StopImmediate"}
         or isinstance(generation, bool)
         or not isinstance(generation, int)
         or generation < 1
@@ -757,6 +758,11 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             if resume_checkpoint is not None
             else None
         )
+        retained_checkpoint_iteration = (
+            int(resume_checkpoint["iteration"])
+            if resume_checkpoint is not None
+            else None
+        )
 
         control_path = Path(os.environ.get("KCC_CONTROL_FILE", str(CONTROL_FILE)))
         try:
@@ -768,6 +774,8 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
         stop_request_generation: int | None = None
         stop_baseline_iteration = 0
         stop_issued = False
+        immediate_stop_generation: int | None = None
+        immediate_stop_issued = False
 
         pending: dict[Any, tuple[Any, Mapping[str, Any], int]] = {}
         for node_rank, _node, actor, identity in ordered:
@@ -829,10 +837,30 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                 )
 
             request = load_runtime_control(control_path, spec)
-            if not stop_issued and request is not None:
+            if not stop_issued and not immediate_stop_issued and request is not None:
                 if request["action"] == "Continue":
                     stop_request_generation = None
                     stop_baseline_iteration = 0
+                    immediate_stop_generation = None
+                elif request["action"] == "StopImmediate":
+                    immediate_stop_generation = int(request["requestGeneration"])
+                    immediate_stop_issued = True
+                    publish_progress(
+                        spec,
+                        "CheckpointCleanup",
+                        "Running",
+                        "stopping workers before deleting unapproved checkpoints",
+                        retainedIteration=retained_checkpoint_iteration,
+                    )
+                    ray.get(
+                        [
+                            actor.stop.remote(
+                                f"immediate stop request {immediate_stop_generation}"
+                            )
+                            for _rank, _node, actor, _identity in ordered
+                        ],
+                        timeout=60,
+                    )
                 elif request["requestGeneration"] != stop_request_generation:
                     try:
                         baseline_views = list(
@@ -857,7 +885,11 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                         )
                         stop_baseline_iteration = baseline or 0
 
-            if stop_request_generation is not None and not stop_issued:
+            if (
+                stop_request_generation is not None
+                and not stop_issued
+                and not immediate_stop_issued
+            ):
                 try:
                     iteration_views = list(
                         ray.get(
@@ -954,6 +986,42 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                 except Exception:
                     pass
 
+        checkpoint_cleanup: Mapping[str, Any] | None = None
+        checkpoint_cleanup_error: str | None = None
+        if immediate_stop_issued:
+            try:
+                checkpoint_cleanup = dict(
+                    ray.get(
+                        ordered[0][2].discard_uncommitted_checkpoints.remote(
+                            str(spec.checkpoint_root),
+                            retained_checkpoint_iteration,
+                        ),
+                        timeout=300,
+                    )
+                )
+                checkpoint_cleanup = {**checkpoint_cleanup, "completed": True}
+                publish_progress(
+                    spec,
+                    "CheckpointCleanup",
+                    "Passed",
+                    "unapproved checkpoints were deleted",
+                    **checkpoint_cleanup,
+                )
+            except Exception as error:
+                checkpoint_cleanup_error = f"{type(error).__name__}: {error}"
+                checkpoint_cleanup = {
+                    "completed": False,
+                    "retainedIteration": retained_checkpoint_iteration,
+                    "error": checkpoint_cleanup_error,
+                }
+                publish_progress(
+                    spec,
+                    "CheckpointCleanup",
+                    "Failed",
+                    "checkpoint cleanup failed",
+                    **checkpoint_cleanup,
+                )
+
         checkpoint: Mapping[str, Any] | None = None
         checkpoint_error: CheckpointError | None = None
         try:
@@ -991,7 +1059,7 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
         elif checkpoint_error is not None:
             status = "FAIL"
             failure_scope = "checkpoint"
-        elif stop_issued:
+        elif stop_issued or immediate_stop_issued:
             status = "STOPPED"
             failure_scope = None
         else:
@@ -1028,8 +1096,16 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                 stopRequestGeneration=stop_request_generation,
                 stopBaselineIteration=stop_baseline_iteration,
             )
+        elif immediate_stop_issued:
+            result.update(
+                stopReason="Immediate",
+                stopRequestGeneration=immediate_stop_generation,
+                checkpointCleanup=checkpoint_cleanup,
+            )
         if checkpoint_error is not None:
             result["checkpointFailure"] = str(checkpoint_error)
+        if checkpoint_cleanup_error is not None:
+            result["checkpointCleanupFailure"] = checkpoint_cleanup_error
         publish_progress(
             spec,
             "Training",

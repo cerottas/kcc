@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
+import shutil
 from typing import Any, Mapping, Sequence
 
 
@@ -11,6 +14,7 @@ MAX_TRACKER_BYTES = 4096
 MAX_FILES = 100000
 SAMPLE_BYTES = 64 * 1024
 SAMPLE_BLOCKS = 3
+ITERATION_DIRECTORY = re.compile(r"^iter_([0-9]{7,})$")
 
 
 class CheckpointError(RuntimeError):
@@ -19,6 +23,50 @@ class CheckpointError(RuntimeError):
 
 class CheckpointUnavailable(CheckpointError):
     """No checkpoint has been committed yet."""
+
+
+def discard_uncommitted(
+    checkpoint_root: Path,
+    keep_iteration: int | None,
+) -> dict[str, Any]:
+    """Delete checkpoints created after the last controller-approved baseline."""
+    if keep_iteration is not None and keep_iteration <= 0:
+        raise CheckpointError("retained checkpoint iteration must be positive")
+    if not checkpoint_root.is_absolute():
+        raise CheckpointError("checkpoint cleanup root must be absolute")
+    if checkpoint_root.is_symlink():
+        raise CheckpointError("checkpoint cleanup root cannot be a symbolic link")
+    if not checkpoint_root.exists():
+        return {"removedEntries": 0, "retainedIteration": keep_iteration}
+    if not checkpoint_root.is_dir():
+        raise CheckpointError("checkpoint cleanup root is not a directory")
+
+    removed = 0
+    if keep_iteration is None:
+        removed = sum(1 for _ in checkpoint_root.iterdir())
+        shutil.rmtree(checkpoint_root)
+        return {"removedEntries": removed, "retainedIteration": None}
+
+    retained = checkpoint_root / f"iter_{keep_iteration:07d}"
+    if not retained.is_dir() or retained.is_symlink():
+        raise CheckpointError("retained checkpoint directory is missing or unsafe")
+    for candidate in list(checkpoint_root.iterdir()):
+        match = ITERATION_DIRECTORY.fullmatch(candidate.name)
+        if match and int(match.group(1)) <= keep_iteration:
+            continue
+        if candidate.name == TRACKER:
+            continue
+        if candidate.is_symlink() or candidate.is_file():
+            candidate.unlink()
+        elif candidate.is_dir():
+            shutil.rmtree(candidate)
+        else:
+            raise CheckpointError("checkpoint cleanup entry has unsupported type")
+        removed += 1
+    temporary = checkpoint_root / f".{TRACKER}.tmp"
+    temporary.write_text(f"{keep_iteration}\n", encoding="utf-8")
+    os.replace(temporary, checkpoint_root / TRACKER)
+    return {"removedEntries": removed, "retainedIteration": keep_iteration}
 
 
 def _sample_sha256(path: Path, size: int) -> str:
@@ -124,4 +172,3 @@ def require_consistent(
     if len(digests) != 1 or None in digests:
         raise CheckpointError("workers see different committed checkpoints")
     return views[0]
-
