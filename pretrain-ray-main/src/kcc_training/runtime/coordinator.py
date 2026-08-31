@@ -31,6 +31,48 @@ DEFAULT_PROBE_BINARY = "/opt/kcc-hccl/bin/ranktable_allreduce_probe"
 CONTROL_FILE = Path("/etc/kcc/control/control.json")
 MAX_CONTROL_BYTES = 64 * 1024
 PROGRESS_SCHEMA = "kcc-runtime-progress/v1"
+MAX_PROGRESS_HISTORY = 500
+
+
+def _progress_history(
+    current: Mapping[str, Any] | None,
+    progress: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Keep stage milestones while coalescing repetitive training heartbeats."""
+    history: list[Mapping[str, Any]] = []
+    data = current.get("data") if isinstance(current, Mapping) else None
+    raw = data.get("history.json") if isinstance(data, Mapping) else None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            history = [item for item in parsed if isinstance(item, Mapping)]
+
+    if history and all(
+        history[-1].get(key) == progress.get(key)
+        for key in ("stage", "status", "message")
+    ):
+        history[-1] = dict(progress)
+    else:
+        history.append(dict(progress))
+
+    if len(history) > MAX_PROGRESS_HISTORY:
+        # Early entries contain HCCL/RankTable evidence; keep those as well as
+        # the newest runtime activity.
+        history = history[:100] + history[-(MAX_PROGRESS_HISTORY - 100) :]
+    return history
+
+
+def _training_output_chunk(path: Path, offset: int, max_bytes: int) -> tuple[str, int]:
+    if not path.is_file():
+        return "", offset
+    with path.open("rb") as stream:
+        stream.seek(max(offset, 0))
+        payload = stream.read(max_bytes)
+        next_offset = stream.tell()
+    return payload.decode("utf-8", errors="replace"), next_offset
 
 
 def publish_progress(
@@ -58,6 +100,22 @@ def publish_progress(
     )
     cluster_name = attempt_name(spec.run_name, spec.attempt)
     name = f"{cluster_name}-progress"
+    item_path = core_namespaced_path(spec.namespace, "configmaps", name)
+    try:
+        api = KubernetesApi()
+    except Exception as error:
+        print(f"KCC_PROGRESS publish warning: {error}", file=sys.stderr, flush=True)
+        return
+    try:
+        current = api.get(item_path)
+    except Exception as error:
+        current = None
+        print(
+            f"KCC_PROGRESS history read warning: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+    history = _progress_history(current, progress)
     document = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -83,13 +141,16 @@ def publish_progress(
         "data": {
             "progress.json": json.dumps(
                 progress, ensure_ascii=False, sort_keys=True, default=str
-            )
+            ),
+            "history.json": json.dumps(
+                history, ensure_ascii=False, sort_keys=True, default=str
+            ),
         },
     }
     try:
-        KubernetesApi().upsert(
+        api.upsert(
             core_namespaced_path(spec.namespace, "configmaps"),
-            core_namespaced_path(spec.namespace, "configmaps", name),
+            item_path,
             document,
         )
     except Exception as error:
@@ -803,6 +864,45 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
         failure = False
         training_started = time.monotonic()
         last_progress_report = 0.0
+        training_log_offsets = {
+            node_rank: {"stdout": 0, "stderr": 0}
+            for node_rank, _node, _actor, _identity in ordered
+        }
+
+        def forward_training_output() -> None:
+            for node_rank, node, _actor, _identity in ordered:
+                for stream in ("stdout", "stderr"):
+                    try:
+                        text, next_offset = _training_output_chunk(
+                            log_root / f"node-rank-{node_rank}" / f"{stream}.log",
+                            training_log_offsets[node_rank][stream],
+                            64 * 1024,
+                        )
+                    except OSError as error:
+                        print(
+                            f"KCC_TRAINING_OUTPUT read warning: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    training_log_offsets[node_rank][stream] = next_offset
+                    if not text:
+                        continue
+                    print(
+                        "KCC_TRAINING_OUTPUT "
+                        + json.dumps(
+                            {
+                                "nodeRank": node_rank,
+                                "nodeName": node,
+                                "stream": stream,
+                                "text": text,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+
         publish_progress(
             spec,
             "Training",
@@ -835,6 +935,7 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                     remainingWorkers=len(pending),
                     checkpointIteration=checkpoint_iteration,
                 )
+                forward_training_output()
 
             request = load_runtime_control(control_path, spec)
             if not stop_issued and not immediate_stop_issued and request is not None:
@@ -985,6 +1086,8 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                     )
                 except Exception:
                     pass
+
+        forward_training_output()
 
         checkpoint_cleanup: Mapping[str, Any] | None = None
         checkpoint_cleanup_error: str | None = None

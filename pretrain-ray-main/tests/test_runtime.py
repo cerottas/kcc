@@ -381,7 +381,40 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(document["metadata"]["name"], "run-1-a02-progress")
         self.assertEqual(progress["stage"], "Training")
         self.assertEqual(progress["details"]["checkpointIteration"], 12)
+        history = json.loads(document["data"]["history.json"])
+        self.assertEqual(history, [progress])
         self.assertTrue(output.call_args.args[0].startswith("KCC_PROGRESS "))
+
+    def test_progress_history_keeps_milestones_and_coalesces_heartbeats(self):
+        existing = [
+            {"stage": "HcclTest", "status": "Passed", "message": "passed"},
+            {
+                "stage": "Training",
+                "status": "Running",
+                "message": "distributed training is running",
+                "details": {"checkpointIteration": 10},
+            },
+        ]
+        current = {"data": {"history.json": json.dumps(existing)}}
+        progress = {
+            "stage": "Training",
+            "status": "Running",
+            "message": "distributed training is running",
+            "details": {"checkpointIteration": 20},
+        }
+        history = coordinator_module._progress_history(current, progress)
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["stage"], "HcclTest")
+        self.assertEqual(history[-1]["details"]["checkpointIteration"], 20)
+
+    def test_training_output_chunk_reads_only_new_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stdout.log"
+            path.write_text("first\nsecond\n", encoding="utf-8")
+            first, offset = coordinator_module._training_output_chunk(path, 0, 6)
+            second, _offset = coordinator_module._training_output_chunk(path, offset, 64)
+        self.assertEqual(first, "first\n")
+        self.assertEqual(second, "second\n")
 
     def test_runtime_exception_after_spec_load_is_published(self):
         with tempfile.TemporaryDirectory() as directory:
