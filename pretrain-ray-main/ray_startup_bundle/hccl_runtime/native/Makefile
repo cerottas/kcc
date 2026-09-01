@@ -8,7 +8,10 @@ CXXFLAGS += -std=c++11 -O2 -Wall -Wextra -Wpedantic -Werror \
 	-fstack-protector-strong -fPIE -MMD -MP
 CPPFLAGS += -isystem $(ASCEND_DIR)/include
 LDFLAGS += -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
-	-L$(ASCEND_DIR)/lib64 -Wl,-rpath,$(ASCEND_DIR)/lib64
+	-L$(ASCEND_DIR)/lib64 -Wl,-rpath,$(ASCEND_DIR)/lib64 \
+	-Wl,-rpath-link,/usr/local/Ascend/driver/lib64/common \
+	-Wl,-rpath-link,/usr/local/Ascend/driver/lib64/driver \
+	-Wl,-rpath-link,/usr/local/Ascend/driver/lib64
 LDLIBS += -lhccl -lascendcl
 
 .PHONY: all clean

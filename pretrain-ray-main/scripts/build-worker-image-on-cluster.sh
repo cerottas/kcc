@@ -97,8 +97,42 @@ cleanup() {
 }
 trap cleanup EXIT
 
-overrides=$(printf \
-  '{"spec":{"nodeName":"%s","terminationGracePeriodSeconds":0}}' "$node")
+overrides=$(python3 - "$node" "$pod" "$worker_base" "$worker_python" \
+  "${CANN_ASCEND_DIR:-}" <<'PY'
+import json
+import sys
+
+node, pod, image, worker_python, ascend_dir = sys.argv[1:]
+environment = [{"name": "KCC_WORKER_PYTHON", "value": worker_python}]
+if ascend_dir:
+    environment.append({"name": "CANN_ASCEND_DIR", "value": ascend_dir})
+print(json.dumps({
+    "spec": {
+        "nodeName": node,
+        "terminationGracePeriodSeconds": 0,
+        "volumes": [{
+            "name": "ascend-driver",
+            "hostPath": {
+                "path": "/usr/local/Ascend/driver",
+                "type": "Directory",
+            },
+        }],
+        "containers": [{
+            "name": pod,
+            "image": image,
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["/bin/bash", "-lc", "sleep 3600"],
+            "env": environment,
+            "volumeMounts": [{
+                "name": "ascend-driver",
+                "mountPath": "/usr/local/Ascend/driver",
+                "readOnly": True,
+            }],
+        }],
+    },
+}))
+PY
+)
 run_args=(
   -n "$namespace" run "$pod"
   "--image=$worker_base"
@@ -106,11 +140,6 @@ run_args=(
   --restart=Never
   "--overrides=$overrides"
 )
-if [[ -n ${CANN_ASCEND_DIR:-} ]]; then
-  run_args+=("--env=CANN_ASCEND_DIR=$CANN_ASCEND_DIR")
-fi
-run_args+=("--env=KCC_WORKER_PYTHON=$worker_python")
-run_args+=(--command -- /bin/bash -lc 'sleep 3600')
 
 "${kubectl_command[@]}" "${run_args[@]}" >/dev/null
 "${kubectl_command[@]}" -n "$namespace" wait \
