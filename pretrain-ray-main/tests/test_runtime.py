@@ -24,7 +24,11 @@ from kcc_training.runtime.coordinator import (
     wait_ranktable,
 )
 from kcc_training.runtime.spec import RuntimeSpec, RuntimeSpecError
-from kcc_training.runtime.worker import StructuredWorker, sourced_ascend_environment
+from kcc_training.runtime.worker import (
+    StructuredWorker,
+    shared_training_progress_signature,
+    sourced_ascend_environment,
+)
 from ray_startup_bundle.hccl_runtime.hccl_check import _ping as ping_module
 from ray_startup_bundle.hccl_runtime.hccl_check import _hccl as hccl_module
 
@@ -464,6 +468,27 @@ class RuntimeTests(unittest.TestCase):
             second, _offset = coordinator_module._training_output_chunk(path, offset, 64)
         self.assertEqual(first, "first\n")
         self.assertEqual(second, "second\n")
+
+    def test_worker_progress_follows_output_from_any_node_rank(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_root = root / "logs"
+            checkpoint_root = root / "checkpoints"
+            (log_root / "node-rank-0").mkdir(parents=True)
+            (log_root / "node-rank-1").mkdir(parents=True)
+            for node_rank in (0, 1):
+                for stream in ("stdout", "stderr"):
+                    (log_root / f"node-rank-{node_rank}" / f"{stream}.log").touch()
+            before = shared_training_progress_signature(
+                log_root, 2, checkpoint_root
+            )
+            (log_root / "node-rank-1" / "stdout.log").write_text(
+                "iteration 10/100\n", encoding="utf-8"
+            )
+            after = shared_training_progress_signature(
+                log_root, 2, checkpoint_root
+            )
+        self.assertNotEqual(before, after)
 
     def test_runtime_exception_after_spec_load_is_published(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -84,6 +84,33 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def shared_training_progress_signature(
+    log_root: Path,
+    workers: int,
+    checkpoint_root: Path,
+) -> tuple[tuple[int, int], ...]:
+    """Observe world-level progress, regardless of which rank prints metrics."""
+
+    signature: list[tuple[int, int]] = []
+    for node_rank in range(workers):
+        for stream in ("stdout", "stderr"):
+            path = log_root / f"node-rank-{node_rank}" / f"{stream}.log"
+            try:
+                stat = path.stat()
+            except OSError:
+                signature.append((0, 0))
+            else:
+                signature.append((stat.st_size, stat.st_mtime_ns))
+    tracker = checkpoint_root / TRACKER
+    try:
+        stat = tracker.stat()
+    except OSError:
+        signature.append((0, 0))
+    else:
+        signature.append((stat.st_size, stat.st_mtime_ns))
+    return tuple(signature)
+
+
 class StructuredWorker:
     def __init__(self) -> None:
         self.process: subprocess.Popen[str] | None = None
@@ -224,7 +251,7 @@ class StructuredWorker:
         child_env.update(runtime_env)
         started = time.monotonic()
         last_progress = started
-        last_signature: tuple[int, int, int] | None = None
+        last_signature: tuple[tuple[int, int], ...] | None = None
         with stdout_path.open("x", encoding="utf-8") as stdout, stderr_path.open("x", encoding="utf-8") as stderr:
             self.process = subprocess.Popen(
                 argv,
@@ -244,11 +271,10 @@ class StructuredWorker:
                         self._terminate(self.process)
                         break
                     if node_rank == 0 and no_progress_seconds:
-                        tracker = Path(checkpoint_root) / "latest_checkpointed_iteration.txt"
-                        signature = (
-                            stdout_path.stat().st_size,
-                            stderr_path.stat().st_size,
-                            tracker.stat().st_mtime_ns if tracker.exists() else 0,
+                        signature = shared_training_progress_signature(
+                            Path(log_root),
+                            workers,
+                            Path(checkpoint_root),
                         )
                         if last_signature is None or signature != last_signature:
                             last_signature = signature
