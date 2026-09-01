@@ -17,6 +17,31 @@ def resource(kind, name, spec):
 
 
 class ApiV1Beta1Tests(unittest.TestCase):
+    def test_recipe_accepts_an_inline_training_script(self) -> None:
+        document = resource(
+            "TrainingRecipe",
+            "inline",
+            {
+                "framework": "mindspeed-llm",
+                "command": ["bash", "pretrain_150M.sh"],
+                "workingDirectory": ".",
+                "environment": {},
+                "artifacts": {
+                    "source": "artifact://training/source/v1",
+                    "model": "artifact://training/model/v1",
+                    "data": "artifact://training/data/v1",
+                    "outputSubpath": "runs/inline",
+                },
+            },
+        )
+        document["metadata"]["annotations"] = {
+            "training.kcc.io/script-name": "pretrain_150M.sh",
+            "training.kcc.io/script-content": "#!/bin/bash\npython pretrain_gpt.py\n",
+        }
+        recipe = Recipe.from_resource(document)
+        self.assertEqual(recipe.script_name, "pretrain_150M.sh")
+        self.assertIn("pretrain_gpt.py", recipe.script_content or "")
+
     def test_profile_is_cluster_owned_and_digest_pinned(self) -> None:
         profile = RuntimeProfile.from_resource(
             resource(

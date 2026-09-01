@@ -64,6 +64,53 @@ class RayClusterTests(unittest.TestCase):
         self.assertNotIn("hostPath", str(head_volumes))
         self.assertTrue(worker["containers"][0]["securityContext"]["privileged"])
 
+    def test_mindspeed_recipe_mounts_legacy_models_on_workers_only(self) -> None:
+        run, profile, recipe = objects()
+        recipe = replace(
+            recipe,
+            framework="mindspeed-llm",
+            script_name="pretrain_150M.sh",
+            script_content="#!/usr/bin/env bash\npython pretrain_gpt.py\n",
+        )
+        configmap, cluster = render_attempt(
+            run,
+            profile,
+            recipe,
+            attempt=0,
+            active_nodes=("node-a", "node-b"),
+            runtime_service_account="runtime",
+        )
+        head = cluster["spec"]["headGroupSpec"]["template"]["spec"]
+        worker = cluster["spec"]["workerGroupSpecs"][0]["template"]["spec"]
+        self.assertNotIn("mindspeed-models", str(head["volumes"]))
+        self.assertIn(
+            {
+                "name": "mindspeed-models",
+                "hostPath": {"path": "/mnt/models", "type": "Directory"},
+            },
+            worker["volumes"],
+        )
+        self.assertIn(
+            {"name": "mindspeed-models", "mountPath": "/mnt/models"},
+            worker["containers"][0]["volumeMounts"],
+        )
+        self.assertEqual(
+            configmap["data"]["pretrain_150M.sh"],
+            "#!/usr/bin/env bash\npython pretrain_gpt.py\n",
+        )
+        self.assertIn(
+            {
+                "name": "run-spec",
+                "mountPath": (
+                    "/workspace/.kcc/artifacts/source/"
+                    "fdd1e5579c88a6b82846e88a/pretrain_150M.sh"
+                ),
+                "subPath": "pretrain_150M.sh",
+                "readOnly": True,
+            },
+            worker["containers"][0]["volumeMounts"],
+        )
+
 
     def test_attempt_mounts_owned_runtime_control(self) -> None:
         run, profile, recipe = objects()

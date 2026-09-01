@@ -248,6 +248,8 @@ def render_attempt(
         },
         "data": {"run.json": json.dumps(spec, ensure_ascii=False, sort_keys=True)},
     }
+    if recipe.script_name is not None and recipe.script_content is not None:
+        configmap["data"][recipe.script_name] = recipe.script_content
     shared_volumes = [
         {"name": "run-spec", "configMap": {"name": f"{name}-spec"}},
         {"name": "control", "configMap": {"name": f"{name}-control"}},
@@ -268,6 +270,18 @@ def render_attempt(
     ]
     worker_volumes = list(shared_volumes)
     worker_mounts = list(mounts)
+    if recipe.script_name is not None:
+        worker_mounts.append(
+            {
+                "name": "run-spec",
+                "mountPath": str(
+                    PurePosixPath(spec["training"]["workingDirectory"])
+                    / recipe.script_name
+                ),
+                "subPath": recipe.script_name,
+                "readOnly": True,
+            }
+        )
     if profile.resource_name == "huawei.com/Ascend910":
         # The Ascend device plugin allocates devices, but this target cluster
         # does not inject the host driver tools into the container. HCCL
@@ -286,6 +300,25 @@ def render_attempt(
                 "name": "ascend-driver",
                 "mountPath": "/usr/local/Ascend/driver",
                 "readOnly": True,
+            }
+        )
+    if recipe.framework == "mindspeed-llm":
+        # The existing MindSpeed training estate is an NFS filesystem mounted
+        # by every GPU worker at /mnt/models.  Keep KCC's portable workspace
+        # PVC for source, checkpoints, logs, and output, and expose the large
+        # legacy model/data tree only to the processes that consume it.  The
+        # Ray head runs on the control node, which cannot route to that NFS
+        # backend and therefore must not mount it.
+        worker_volumes.append(
+            {
+                "name": "mindspeed-models",
+                "hostPath": {"path": "/mnt/models", "type": "Directory"},
+            }
+        )
+        worker_mounts.append(
+            {
+                "name": "mindspeed-models",
+                "mountPath": "/mnt/models",
             }
         )
     cluster = {

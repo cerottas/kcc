@@ -15,6 +15,8 @@ _IMAGE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
 _DNS_SUBDOMAIN = re.compile(r"^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$")
 _ARTIFACT_URI = re.compile(r"^artifact://[^/?#\s]+/[^/?#\s]+/[^/?#\s]+$")
 _ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SCRIPT_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+_MAX_INLINE_SCRIPT_BYTES = 512 * 1024
 
 
 class ApiValidationError(ValueError):
@@ -347,6 +349,8 @@ class Recipe:
     model_uri: str
     data_uri: str
     output_subpath: str
+    script_name: str | None = None
+    script_content: str | None = None
 
     @classmethod
     def from_resource(cls, document: Mapping[str, Any]) -> "Recipe":
@@ -363,6 +367,27 @@ class Recipe:
             raise ApiValidationError("outputSubpath is unsafe")
         if cwd.startswith("/") or ".." in cwd.split("/"):
             raise ApiValidationError("workingDirectory must be a safe relative path")
+        object_metadata = mapping(document.get("metadata"), "metadata")
+        annotations = mapping(
+            object_metadata.get("annotations", {}), "metadata.annotations"
+        )
+        raw_script_name = annotations.get("training.kcc.io/script-name")
+        raw_script_content = annotations.get("training.kcc.io/script-content")
+        if (raw_script_name is None) != (raw_script_content is None):
+            raise ApiValidationError(
+                "script-name and script-content annotations must be provided together"
+            )
+        script_name: str | None = None
+        script_content: str | None = None
+        if raw_script_name is not None:
+            script_name = text(raw_script_name, "script-name annotation")
+            if _SCRIPT_NAME.fullmatch(script_name) is None:
+                raise ApiValidationError("script-name annotation is invalid")
+            if not isinstance(raw_script_content, str) or not raw_script_content.strip():
+                raise ApiValidationError("script-content annotation is invalid")
+            if len(raw_script_content.encode("utf-8")) > _MAX_INLINE_SCRIPT_BYTES:
+                raise ApiValidationError("script-content annotation exceeds 512 KiB")
+            script_content = raw_script_content
         return cls(
             identity=identity,
             framework=text(spec["framework"], "framework"),
@@ -373,6 +398,8 @@ class Recipe:
             model_uri=artifact_uri(artifacts["model"], "artifacts.model"),
             data_uri=artifact_uri(artifacts["data"], "artifacts.data"),
             output_subpath=output,
+            script_name=script_name,
+            script_content=script_content,
         )
 
 
