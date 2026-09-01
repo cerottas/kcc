@@ -712,6 +712,49 @@ def validate_preparations(
     }
 
 
+def single_rank_no_collective_results(
+    preparations: Sequence[Mapping[str, Any]],
+    preflight: Mapping[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Return truthful PASS evidence when no inter-rank collective exists."""
+    if int(preflight["world_size"]) != 1:
+        return None
+    if len(preparations) != 1 or list(preparations[0]["rank_ids"]) != [0]:
+        raise ValidationError("single-rank topology does not contain exactly rank 0")
+    prepared = preparations[0]
+    device_ids = list(prepared["device_ids"])
+    device_ips = list(prepared["device_ips"])
+    if len(device_ids) != 1 or len(device_ips) != 1:
+        raise ValidationError("single-rank topology does not contain exactly one device")
+    return [
+        {
+            "ray_node_id": prepared["ray_node_id"],
+            "server_id": prepared["server_id"],
+            "rank_start": prepared["rank_start"],
+            "status": "PASS",
+            "failure": None,
+            "timed_out": False,
+            "ranktable_sha256": prepared["ranktable_sha256"],
+            "probe_binary_sha256": prepared["probe_binary_sha256"],
+            "collective_skipped": True,
+            "ranks": [
+                {
+                    "rank_id": 0,
+                    "device_id": device_ids[0],
+                    "device_ip": device_ips[0],
+                    "exit_code": None,
+                    "pass_marker": True,
+                    "status": "PASS",
+                    "log_path": None,
+                    "log_tail": "single rank: no inter-rank HCCL collective is required",
+                    "collective_skipped": True,
+                }
+            ],
+            "cleanup": [],
+        }
+    ]
+
+
 def _terminate_processes(
     processes: Sequence[subprocess.Popen[Any]], grace_seconds: float
 ) -> list[dict[str, Any]]:
@@ -1405,32 +1448,39 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             expected_world_size=args.expected_world_size,
         )
 
-        pending = {actor.run.remote(): actor for actor in actors}
-        deadline = time.monotonic() + args.overall_timeout
-        while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                failure = f"overall timeout after {args.overall_timeout} seconds"
-                break
-            ready, _ = ray.wait(
-                list(pending), num_returns=1, timeout=min(1.0, remaining)
-            )
-            if not ready:
-                continue
-            reference = ready[0]
-            pending.pop(reference)
-            try:
-                result = ray.get(reference)
-            except Exception as error:
-                result = {
-                    "status": "FAIL",
-                    "failure": f"{type(error).__name__}: {error}",
-                    "ranks": [],
-                }
-            run_results.append(result)
-            if result.get("status") != "PASS":
-                failure = str(result.get("failure") or "worker HCCL test failed")
-                break
+        single_rank_results = single_rank_no_collective_results(
+            preparations, preflight
+        )
+        pending: dict[Any, Any] = {}
+        if single_rank_results is not None:
+            run_results.extend(single_rank_results)
+        else:
+            pending = {actor.run.remote(): actor for actor in actors}
+            deadline = time.monotonic() + args.overall_timeout
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = f"overall timeout after {args.overall_timeout} seconds"
+                    break
+                ready, _ = ray.wait(
+                    list(pending), num_returns=1, timeout=min(1.0, remaining)
+                )
+                if not ready:
+                    continue
+                reference = ready[0]
+                pending.pop(reference)
+                try:
+                    result = ray.get(reference)
+                except Exception as error:
+                    result = {
+                        "status": "FAIL",
+                        "failure": f"{type(error).__name__}: {error}",
+                        "ranks": [],
+                    }
+                run_results.append(result)
+                if result.get("status") != "PASS":
+                    failure = str(result.get("failure") or "worker HCCL test failed")
+                    break
         if failure is not None:
             cleanup = _stop_actors(ray, actors, args.kill_grace)
             if not cleanup["all_process_groups_gone"]:
@@ -1484,6 +1534,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "mode": "execute",
             "validation_kind": "public_hccl_api_ranktable_smoke",
             "official_hccltest": False,
+            "single_rank_no_collective": int(preflight["world_size"]) == 1,
             "status": "PASS" if failure is None else "FAIL",
             "failure": failure,
             "mpi_used": False,

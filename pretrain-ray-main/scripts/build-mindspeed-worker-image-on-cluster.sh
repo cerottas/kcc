@@ -71,10 +71,19 @@ archive=/mnt/models/CODE/env/conda_env/ms_env.tar.gz
 [[ -r "$archive" ]] || { printf "missing MindSpeed environment archive: %s\n" "$archive" >&2; exit 1; }
 rm -rf /tmp/mindspeed-extract /tmp/mindspeed-python
 install -d -m 0755 /tmp/mindspeed-extract /tmp/mindspeed-python
-tar -tzf "$archive" | grep -E \
-  "^ms/lib/python3[.]10/site-packages/(datasets/|datasets-3[.]6[.]0[.]dist-info/|transformers/|transformers-4[.]57[.]1[.]dist-info/|huggingface_hub/|huggingface_hub-0[.]35[.]3[.]dist-info/|fsspec/|fsspec-2025[.]3[.]0[.]dist-info/|dill/|dill-0[.]3[.]8[.]dist-info/|multiprocess/|multiprocess-0[.]70[.]16[.]dist-info/)" \
-  > /tmp/mindspeed-members.txt
-tar -xzf "$archive" -C /tmp/mindspeed-extract -T /tmp/mindspeed-members.txt
+tar -xzf "$archive" -C /tmp/mindspeed-extract \
+  ms/lib/python3.10/site-packages/datasets \
+  ms/lib/python3.10/site-packages/datasets-3.6.0.dist-info \
+  ms/lib/python3.10/site-packages/transformers \
+  ms/lib/python3.10/site-packages/transformers-4.57.1.dist-info \
+  ms/lib/python3.10/site-packages/huggingface_hub \
+  ms/lib/python3.10/site-packages/huggingface_hub-0.35.3.dist-info \
+  ms/lib/python3.10/site-packages/fsspec \
+  ms/lib/python3.10/site-packages/fsspec-2025.3.0.dist-info \
+  ms/lib/python3.10/site-packages/dill \
+  ms/lib/python3.10/site-packages/dill-0.3.8.dist-info \
+  ms/lib/python3.10/site-packages/multiprocess \
+  ms/lib/python3.10/site-packages/multiprocess-0.70.16.dist-info
 cp -a /tmp/mindspeed-extract/ms/lib/python3.10/site-packages/. /tmp/mindspeed-python/
 find /tmp/mindspeed-python -type d -name __pycache__ -prune -exec rm -rf {} +
 python -m pip install --no-cache-dir --no-deps --target /tmp/mindspeed-python xxhash==3.5.0

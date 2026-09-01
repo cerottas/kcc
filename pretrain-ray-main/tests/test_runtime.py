@@ -26,6 +26,7 @@ from kcc_training.runtime.coordinator import (
 from kcc_training.runtime.spec import RuntimeSpec, RuntimeSpecError
 from kcc_training.runtime.worker import StructuredWorker
 from ray_startup_bundle.hccl_runtime.hccl_check import _ping as ping_module
+from ray_startup_bundle.hccl_runtime.hccl_check import _hccl as hccl_module
 
 
 def spec_document():
@@ -45,6 +46,30 @@ def spec_document():
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_single_rank_hccl_records_no_collective_evidence(self):
+        preparation = {
+            "ray_node_id": "ray-node-a",
+            "server_id": "server-a",
+            "rank_start": 0,
+            "rank_ids": [0],
+            "device_ids": [0],
+            "device_ips": ["192.0.2.10"],
+            "ranktable_sha256": "a" * 64,
+            "probe_binary_sha256": "b" * 64,
+        }
+        results = hccl_module.single_rank_no_collective_results(
+            [preparation], {"world_size": 1}
+        )
+        self.assertIsNotNone(results)
+        self.assertEqual(results[0]["status"], "PASS")
+        self.assertTrue(results[0]["collective_skipped"])
+        self.assertTrue(results[0]["ranks"][0]["collective_skipped"])
+        self.assertIsNone(
+            hccl_module.single_rank_no_collective_results(
+                [preparation], {"world_size": 2}
+            )
+        )
+
     def test_spec_loads_structured_command(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.json"

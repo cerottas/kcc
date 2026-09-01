@@ -671,13 +671,24 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
         expectedRanks=spec.workers * spec.devices_per_node,
     )
     hccl_result = run_hccl_gate(spec, attempt_root)
+    hccl_stage = _pipeline_stage(hccl_result, "hccl")
+    hccl_payload = hccl_stage.get("result") if hccl_stage is not None else None
+    single_rank_no_collective = (
+        isinstance(hccl_payload, Mapping)
+        and hccl_payload.get("single_rank_no_collective") is True
+    )
     publish_progress(
         spec,
         "HcclTest",
         "Passed",
-        "HCCL AllReduce passed on every rank",
+        (
+            "single rank; no inter-rank HCCL collective is required"
+            if single_rank_no_collective
+            else "HCCL AllReduce passed on every rank"
+        ),
         durationSeconds=round(time.monotonic() - hccl_started, 3),
         rankTableSha256=hccl_result.get("ranktable_sha256"),
+        singleRankNoCollective=single_rank_no_collective,
     )
     raw_projection_timeout = os.environ.get(
         "KCC_RANKTABLE_PROJECTION_TIMEOUT_SECONDS", "120"
