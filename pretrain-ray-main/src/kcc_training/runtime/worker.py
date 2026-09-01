@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
@@ -25,6 +26,32 @@ class WorkerError(RuntimeError):
 
 _FAILURE_SCOPES = {"hardware", "infrastructure", "network", "global-stall", "software"}
 _MAX_FAILURE_REPORT_BYTES = 4096
+_ASCEND_ENV_SCRIPTS = (
+    "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+    "/usr/local/Ascend/cann/ascend-toolkit/set_env.sh",
+    "/usr/local/Ascend/nnal/atb/set_env.sh",
+    "/usr/local/Ascend/cann/nnal/atb/set_env.sh",
+)
+
+
+def sourced_ascend_environment(scripts: Sequence[str] = _ASCEND_ENV_SCRIPTS) -> dict[str, str]:
+    available = [path for path in scripts if Path(path).is_file()]
+    if not available:
+        return {}
+    command = "; ".join(f"source {shlex.quote(path)}" for path in available)
+    completed = subprocess.run(
+        ["bash", "-c", f"set -eo pipefail; {command}; env -0"],
+        check=True,
+        capture_output=True,
+    )
+    environment: dict[str, str] = {}
+    for item in completed.stdout.decode("utf-8", errors="surrogateescape").split("\0"):
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        if key == "LD_LIBRARY_PATH" or key.startswith(("ASCEND_", "ATB_")):
+            environment[key] = value
+    return environment
 
 
 def failure_scope_from_report(path: Path) -> str | None:
@@ -175,6 +202,7 @@ class StructuredWorker:
             *command,
         ]
         child_env = dict(os.environ)
+        child_env.update(sourced_ascend_environment())
         child_env.update(environment)
         runtime_env = {
             "RANK_TABLE_FILE": ranktable,

@@ -24,7 +24,7 @@ from kcc_training.runtime.coordinator import (
     wait_ranktable,
 )
 from kcc_training.runtime.spec import RuntimeSpec, RuntimeSpecError
-from kcc_training.runtime.worker import StructuredWorker
+from kcc_training.runtime.worker import StructuredWorker, sourced_ascend_environment
 from ray_startup_bundle.hccl_runtime.hccl_check import _ping as ping_module
 from ray_startup_bundle.hccl_runtime.hccl_check import _hccl as hccl_module
 
@@ -46,6 +46,30 @@ def spec_document():
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_worker_sources_available_ascend_runtime_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            toolkit = Path(directory) / "toolkit.sh"
+            atb = Path(directory) / "atb.sh"
+            toolkit.write_text(
+                "export ASCEND_HOME_PATH=/opt/ascend\n"
+                "export LD_LIBRARY_PATH=/opt/ascend/lib\n",
+                encoding="utf-8",
+            )
+            atb.write_text(
+                "export ATB_HOME_PATH=/opt/atb\n"
+                "export LD_LIBRARY_PATH=/opt/atb/lib:$LD_LIBRARY_PATH\n"
+                "export UNRELATED_VALUE=ignored\n",
+                encoding="utf-8",
+            )
+            environment = sourced_ascend_environment((str(toolkit), str(atb)))
+        self.assertEqual(environment["ASCEND_HOME_PATH"], "/opt/ascend")
+        self.assertEqual(environment["ATB_HOME_PATH"], "/opt/atb")
+        self.assertEqual(
+            environment["LD_LIBRARY_PATH"],
+            "/opt/atb/lib:/opt/ascend/lib",
+        )
+        self.assertNotIn("UNRELATED_VALUE", environment)
+
     def test_single_rank_hccl_records_no_collective_evidence(self):
         preparation = {
             "ray_node_id": "ray-node-a",
