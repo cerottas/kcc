@@ -22,6 +22,8 @@ worker_base=$3
 node=$4
 namespace=${5:-kcc-training}
 image="$registry/kcc-training-worker:$version"
+worker_python=${KCC_WORKER_PYTHON:-python3}
+runtime_bin=${KCC_WORKER_RUNTIME_BIN:-/usr/local/bin}
 
 if [[ ! "$worker_base" =~ @sha256:[0-9a-f]{64}$ ]]; then
   printf 'worker base image is not digest pinned: %s\n' "$worker_base" >&2
@@ -37,6 +39,14 @@ if [[ ! "$node" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]]; then
 fi
 if [[ -n ${CANN_ASCEND_DIR:-} && ${CANN_ASCEND_DIR} != /* ]]; then
   printf 'CANN_ASCEND_DIR must be absolute: %s\n' "$CANN_ASCEND_DIR" >&2
+  exit 2
+fi
+if [[ "$worker_python" == */* && "$worker_python" != /* ]]; then
+  printf 'KCC_WORKER_PYTHON must be a command name or absolute path: %s\n' "$worker_python" >&2
+  exit 2
+fi
+if [[ "$runtime_bin" != /* ]]; then
+  printf 'KCC_WORKER_RUNTIME_BIN must be absolute: %s\n' "$runtime_bin" >&2
   exit 2
 fi
 
@@ -99,6 +109,7 @@ run_args=(
 if [[ -n ${CANN_ASCEND_DIR:-} ]]; then
   run_args+=("--env=CANN_ASCEND_DIR=$CANN_ASCEND_DIR")
 fi
+run_args+=("--env=KCC_WORKER_PYTHON=$worker_python")
 run_args+=(--command -- /bin/bash -lc 'sleep 3600')
 
 "${kubectl_command[@]}" "${run_args[@]}" >/dev/null
@@ -113,6 +124,7 @@ tar -cf - pyproject.toml README.md src ray_startup_bundle/hccl_runtime | \
 
 "${kubectl_command[@]}" -n "$namespace" exec "$pod" -- /bin/bash -lc '
 set -euo pipefail
+python_command=${KCC_WORKER_PYTHON:-python}
 ascend_dir=${CANN_ASCEND_DIR:-}
 if [[ -z "$ascend_dir" ]]; then
   for candidate in \
@@ -134,7 +146,7 @@ if [[ -z "$ascend_dir" ]]; then
   exit 1
 fi
 cd /tmp/kcc-build/src
-python -m pip install --no-cache-dir --no-deps --no-build-isolation \
+"$python_command" -m pip install --no-cache-dir --no-deps --no-build-isolation \
   --target /tmp/kcc-build/out/site-packages .
 make -C ray_startup_bundle/hccl_runtime/native ASCEND_DIR="$ascend_dir"
 install -m 0755 \
@@ -146,7 +158,7 @@ readelf -h /tmp/kcc-build/out/kcc-hccl/bin/ranktable_allreduce_probe | \
   grep -q "Machine:.*AArch64"
 ldd /tmp/kcc-build/out/kcc-hccl/bin/ranktable_allreduce_probe | \
   grep -q "libhccl.so =>"
-PYTHONPATH=/tmp/kcc-build/out/site-packages python -c \
+PYTHONPATH=/tmp/kcc-build/out/site-packages "$python_command" -c \
   "import kcc_training, ray; print(f\"worker artifacts: kcc={kcc_training.__version__} ray={ray.__version__}\")"
 '
 
@@ -157,6 +169,7 @@ docker buildx build --load --pull --platform linux/arm64 \
   --build-arg "BASE_IMAGE=$worker_base" \
   --build-arg "VERSION=$version" \
   --build-arg "VCS_REF=$vcs_ref" \
+  --build-arg "RUNTIME_BIN=$runtime_bin" \
   --tag "$image" \
   --file docker/Dockerfile.worker-prebuilt "$temporary"
 
