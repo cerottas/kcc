@@ -8,6 +8,7 @@ usage() {
     'The target node must be arm64 and able to pull WORKER_BASE.' \
     'Set KCC_KUBECTL when kubectl is not on PATH; for example:' \
     '  KCC_KUBECTL="sudo /usr/local/bin/k3s kubectl" scripts/build-worker-image-on-cluster.sh ...' \
+    'KCC_WORKER_RUNTIME_BIN defaults to the directory containing KCC_WORKER_PYTHON.' \
     'CANN_ASCEND_DIR may override automatic CANN include/lib discovery inside the base image.'
 }
 
@@ -23,7 +24,7 @@ node=$4
 namespace=${5:-kcc-training}
 image="$registry/kcc-training-worker:$version"
 worker_python=${KCC_WORKER_PYTHON:-python3}
-runtime_bin=${KCC_WORKER_RUNTIME_BIN:-/usr/local/bin}
+runtime_bin=${KCC_WORKER_RUNTIME_BIN:-}
 
 if [[ ! "$worker_base" =~ @sha256:[0-9a-f]{64}$ ]]; then
   printf 'worker base image is not digest pinned: %s\n' "$worker_base" >&2
@@ -45,7 +46,7 @@ if [[ "$worker_python" == */* && "$worker_python" != /* ]]; then
   printf 'KCC_WORKER_PYTHON must be a command name or absolute path: %s\n' "$worker_python" >&2
   exit 2
 fi
-if [[ "$runtime_bin" != /* ]]; then
+if [[ -n "$runtime_bin" && "$runtime_bin" != /* ]]; then
   printf 'KCC_WORKER_RUNTIME_BIN must be absolute: %s\n' "$runtime_bin" >&2
   exit 2
 fi
@@ -145,6 +146,23 @@ run_args=(
 "${kubectl_command[@]}" -n "$namespace" wait \
   --for=condition=Ready "pod/$pod" --timeout=300s >/dev/null
 
+resolved_worker_python=$("${kubectl_command[@]}" -n "$namespace" exec "$pod" -- \
+  /bin/bash -lc 'command -v -- "$KCC_WORKER_PYTHON"')
+if [[ "$resolved_worker_python" != /* ]]; then
+  printf 'unable to resolve KCC_WORKER_PYTHON to an absolute path: %s\n' \
+    "$resolved_worker_python" >&2
+  exit 1
+fi
+if [[ -z "$runtime_bin" ]]; then
+  runtime_bin=${resolved_worker_python%/*}
+fi
+"${kubectl_command[@]}" -n "$namespace" exec "$pod" -- \
+  /bin/bash -c 'test -x "$1/ray"' -- "$runtime_bin" || {
+    printf 'Ray CLI is not executable in KCC_WORKER_RUNTIME_BIN: %s/ray\n' \
+      "$runtime_bin" >&2
+    exit 1
+  }
+
 "${kubectl_command[@]}" -n "$namespace" exec "$pod" -- /bin/bash -lc \
   'rm -rf /tmp/kcc-build && install -d -m 0755 /tmp/kcc-build/src /tmp/kcc-build/out/site-packages /tmp/kcc-build/out/kcc-hccl/bin'
 tar -cf - pyproject.toml README.md src ray_startup_bundle/hccl_runtime | \
@@ -203,5 +221,7 @@ docker buildx build --load --pull --platform linux/arm64 \
   --file docker/Dockerfile.worker-prebuilt "$temporary"
 
 docker image inspect "$image" --format '{{.Architecture}}' | grep -qx arm64
+docker image inspect "$image" --format '{{range .Config.Env}}{{println .}}{{end}}' | \
+  grep -Fq "PATH=$runtime_bin:"
 printf 'Worker image built locally on %s with artifacts compiled on %s.\n' \
   "$image" "$node"
