@@ -49,7 +49,8 @@ class DistributionTests(unittest.TestCase):
                 self.assertIn("DEPRECATED", metadata["description"])
 
     def test_runtime_profile_crd_matches_supported_portability_fields(self) -> None:
-        schema = crd("trainingruntimeprofiles.yaml")["spec"]["versions"][0]["schema"][
+        profile_crd = crd("trainingruntimeprofiles.yaml")
+        schema = profile_crd["spec"]["versions"][0]["schema"][
             "openAPIV3Schema"
         ]["properties"]["spec"]["properties"]
         self.assertEqual(
@@ -87,6 +88,16 @@ class DistributionTests(unittest.TestCase):
                     {"integer", "string"},
                 )
                 self.assertTrue(quantity["x-kubernetes-int-or-string"])
+        profile_spec = profile_crd["spec"]["versions"][0]["schema"][
+            "openAPIV3Schema"
+        ]["properties"]["spec"]
+        validations = profile_spec["x-kubernetes-validations"]
+        self.assertFalse(
+            any(item.get("rule") == "self == oldSelf" for item in validations)
+        )
+        self.assertTrue(
+            any("activeNodes" in item.get("rule", "") for item in validations)
+        )
 
     def test_training_run_crd_caps_combined_recovery_attempts(self) -> None:
         validations = crd("trainingruns.yaml")["spec"]["versions"][0]["schema"][
@@ -192,7 +203,6 @@ class DistributionTests(unittest.TestCase):
         for collection in collections.values():
             self.assertEqual(collection["items"]["maxLength"], 253)
 
-
     def test_chart_defaults_use_release_scoped_runtime_sa_and_pdb(self) -> None:
         values = yaml.safe_load((CHART / "values.yaml").read_text(encoding="utf-8"))
         self.assertEqual(values["runtimeServiceAccount"]["name"], "")
@@ -238,4 +248,3 @@ class DistributionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

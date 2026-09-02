@@ -23,8 +23,6 @@ spec:
               type: object
               required: [images, rayVersion, accelerator, workspace, scheduling, integrations]
               x-kubernetes-validations:
-                - rule: self == oldSelf
-                  message: TrainingRuntimeProfile spec is immutable; publish a new named profile version
                 - rule: >-
                     !self.scheduling.activeNodes.exists(
                       active, active in self.scheduling.spareNodes
@@ -176,4 +174,3 @@ spec:
                               tolerationSeconds: {type: integer, minimum: 0}
                         priorityClassName: {type: string, minLength: 1}
                         rayCpus: {type: integer, minimum: 1}
-
