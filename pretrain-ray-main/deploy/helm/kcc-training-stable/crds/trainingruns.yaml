@@ -24,6 +24,9 @@ spec:
       schema:
         openAPIV3Schema:
           type: object
+          x-kubernetes-validations:
+            - rule: '!has(self.spec.dependsOn) || self.spec.dependsOn != self.metadata.name'
+              message: dependsOn must not reference the TrainingRun itself
           required: [spec]
           properties:
             spec:
@@ -51,6 +54,9 @@ spec:
                     self.recipe == oldSelf.recipe &&
                     self.workers == oldSelf.workers &&
                     self.recovery == oldSelf.recovery &&
+                    ((!has(self.dependsOn) && !has(oldSelf.dependsOn)) ||
+                     (has(self.dependsOn) && has(oldSelf.dependsOn) &&
+                      self.dependsOn == oldSelf.dependsOn)) &&
                     ((!has(self.nodeSelection) && !has(oldSelf.nodeSelection)) ||
                      (has(self.nodeSelection) && has(oldSelf.nodeSelection) &&
                       self.nodeSelection == oldSelf.nodeSelection)) &&
@@ -60,7 +66,7 @@ spec:
                     ((!has(self.training) && !has(oldSelf.training)) ||
                      (has(self.training) && has(oldSelf.training) &&
                       self.training == oldSelf.training))
-                  message: runtimeProfile, recipe, workers, recovery, nodeSelection, runtime, and training are immutable; only suspend and suspendMode may change
+                  message: runtimeProfile, recipe, workers, recovery, dependsOn, nodeSelection, runtime, and training are immutable; only suspend and suspendMode may change
               properties:
                 runtimeProfile:
                   type: string
@@ -70,6 +76,12 @@ spec:
                   type: string
                   pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
                   maxLength: 63
+                dependsOn:
+                  description: Name of the predecessor TrainingRun in this namespace that must succeed first.
+                  type: string
+                  minLength: 1
+                  maxLength: 63
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
                 workers: {type: integer, minimum: 1, maximum: 1024}
                 suspend: {type: boolean, default: false}
                 suspendMode:
@@ -152,7 +164,7 @@ spec:
               properties:
                 phase:
                   type: string
-                  enum: [Pending, Starting, Running, Stopping, Recovering, Suspended, Succeeded, Stopped, ManualRequired]
+                  enum: [Pending, Queued, Starting, Running, Stopping, Recovering, Suspended, Succeeded, Stopped, ManualRequired]
                 observedGeneration: {type: integer, minimum: 1}
                 attempt: {type: integer, minimum: 0}
                 activeNodes:

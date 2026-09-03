@@ -374,6 +374,7 @@ class TrainingRun:
     no_progress_seconds: int
     suspended: bool
     suspend_mode: str
+    depends_on: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "TrainingRun":
@@ -382,7 +383,7 @@ class TrainingRun:
             spec,
             {"runtimeProfile", "recipe", "workers", "recovery"},
             "spec",
-            optional={"suspend", "suspendMode"},
+            optional={"suspend", "suspendMode", "dependsOn"},
         )
         recovery = _mapping(spec["recovery"], "spec.recovery")
         _exact_keys(
@@ -396,6 +397,13 @@ class TrainingRun:
         suspend_mode = spec.get("suspendMode", "Immediate")
         if suspend_mode not in {"Immediate", "AfterCheckpoint"}:
             raise ContractError("spec.suspendMode must be Immediate or AfterCheckpoint")
+        depends_on = (
+            _name(spec["dependsOn"], "spec.dependsOn")
+            if "dependsOn" in spec
+            else None
+        )
+        if depends_on == name:
+            raise ContractError("spec.dependsOn cannot reference the same TrainingRun")
         same_topology_retries = _integer(
             recovery["sameTopologyRetries"],
             "spec.recovery.sameTopologyRetries",
@@ -428,6 +436,7 @@ class TrainingRun:
             ),
             suspended=suspended,
             suspend_mode=suspend_mode,
+            depends_on=depends_on,
         )
 
 LOADERS = {

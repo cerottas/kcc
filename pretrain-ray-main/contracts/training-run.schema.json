@@ -52,6 +52,9 @@
           ],
           "default": "Immediate"
         },
+        "dependsOn": {
+          "$ref": "#/$defs/name"
+        },
         "recovery": {
           "type": "object",
           "description": "The CLI and CRD require (maxReplacements + 1) * (sameTopologyRetries + 1) <= 100.",
@@ -254,6 +257,7 @@
         "phase": {
           "enum": [
             "Pending",
+            "Queued",
             "Starting",
             "Running",
             "Stopping",

@@ -310,6 +310,106 @@ class Reconciler:
         )
         self.api.upsert(collection, path, document)
 
+    def _dependency_ready(
+        self,
+        resource: Mapping[str, Any],
+        run: Run,
+        current: Mapping[str, Any],
+    ) -> bool:
+        """Wait for the preceding run to succeed and release its RayCluster."""
+        dependency_name = run.depends_on
+        if dependency_name is None:
+            return True
+
+        dependency_path = namespaced_path(
+            GROUP,
+            VERSION,
+            run.identity.namespace,
+            "trainingruns",
+            dependency_name,
+        )
+        dependency = self.api.get(dependency_path)
+        reason = "WaitingForDependency"
+        if dependency is None:
+            message = f"waiting for TrainingRun {dependency_name} to be created"
+        else:
+            dependency_phase = _phase(dependency)
+            if dependency_phase != "Succeeded":
+                message = (
+                    f"waiting for TrainingRun {dependency_name} "
+                    f"to succeed; current phase is {dependency_phase}"
+                )
+            else:
+                dependency_status = (
+                    dependency.get("status")
+                    if isinstance(dependency.get("status"), Mapping)
+                    else {}
+                )
+                cluster_names = tuple(
+                    dict.fromkeys(
+                        name
+                        for name in (
+                            dependency_status.get("clusterName"),
+                            dependency_status.get("cleanupClusterName"),
+                        )
+                        if isinstance(name, str) and name
+                    )
+                )
+                remaining = [
+                    name
+                    for name in cluster_names
+                    if self.api.get(
+                        namespaced_path(
+                            "ray.io",
+                            "v1",
+                            run.identity.namespace,
+                            "rayclusters",
+                            name,
+                        )
+                    )
+                    is not None
+                ]
+                if not remaining:
+                    return True
+                reason = "WaitingForDependencyCleanup"
+                message = (
+                    f"waiting for TrainingRun {dependency_name} "
+                    f"to release RayCluster {remaining[0]}"
+                )
+
+        conditions = current.get("conditions")
+        existing = (
+            conditions[0]
+            if isinstance(conditions, list)
+            and conditions
+            and isinstance(conditions[0], Mapping)
+            else {}
+        )
+        if (
+            str(current.get("phase", "Pending")) == "Queued"
+            and current.get("observedGeneration") == run.identity.generation
+            and existing.get("reason") == reason
+            and existing.get("message") == message
+        ):
+            return False
+        self._write_status(
+            resource,
+            _status(
+                resource,
+                phase="Queued",
+                observedGeneration=run.identity.generation,
+                conditions=[
+                    _condition(
+                        "Ready",
+                        "False",
+                        reason,
+                        message,
+                    )
+                ],
+            ),
+        )
+        return False
+
     def reconcile(self, resource: Mapping[str, Any]) -> str:
         try:
             run = Run.from_resource(resource)
@@ -392,6 +492,8 @@ class Reconciler:
             return self._suspend(resource, run, current, phase)
         if phase == "Suspended":
             return self._resume(resource, run, current)
+        if phase in {"Pending", "Queued"} and not self._dependency_ready(resource, run, current):
+            return "Queued"
         profile_pool = set((*profile.active_nodes, *profile.spare_nodes))
         requested_active = run.active_nodes or profile.active_nodes[: run.workers]
         requested_spares = run.spare_nodes if run.active_nodes else profile.spare_nodes
@@ -419,7 +521,7 @@ class Reconciler:
                 if not self._cleanup_cluster(run, cleanup_name):
                     return "Recovering"
             return self._provision_attempt(resource, run, profile, recipe, current, attempt, active, spares)
-        if phase == "Pending":
+        if phase in {"Pending", "Queued"}:
             return self._provision_attempt(resource, run, profile, recipe, current, attempt, active, spares)
 
         cluster_path = namespaced_path("ray.io", "v1", run.identity.namespace, "rayclusters", cluster_name)

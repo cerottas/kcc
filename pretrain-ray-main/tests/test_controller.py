@@ -104,6 +104,95 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("persistentVolumeClaim", rendered)
         self.assertIn("/usr/local/Ascend/driver", rendered)
 
+    def test_dependency_waits_for_success_and_cluster_release(self):
+        self.run["spec"]["dependsOn"] = "run-0"
+        dependency_path = namespaced_path(
+            "training.kcc.io",
+            "v1beta1",
+            "training",
+            "trainingruns",
+            "run-0",
+        )
+
+        self.assertEqual(self.reconciler.reconcile(self.run), "Queued")
+        self.assertEqual(self.api.statuses[-1]["phase"], "Queued")
+        self.assertEqual(
+            self.api.statuses[-1]["conditions"][0]["reason"],
+            "WaitingForDependency",
+        )
+        self.assertEqual(self.api.upserts, [])
+
+        dependency = json.loads(json.dumps(self.run))
+        dependency["metadata"]["name"] = "run-0"
+        dependency["status"] = {
+            "phase": "Succeeded",
+            "clusterName": "run-0-a00",
+        }
+        self.api.objects[dependency_path] = dependency
+        dependency_cluster_path = namespaced_path(
+            "ray.io",
+            "v1",
+            "training",
+            "rayclusters",
+            "run-0-a00",
+        )
+        self.api.objects[dependency_cluster_path] = {"metadata": {"name": "run-0-a00"}}
+
+        queued = with_status(self.run, self.api.statuses[-1])
+        self.assertEqual(self.reconciler.reconcile(queued), "Queued")
+        self.assertEqual(
+            self.api.statuses[-1]["conditions"][0]["reason"],
+            "WaitingForDependencyCleanup",
+        )
+        self.assertEqual(self.api.upserts, [])
+
+        del self.api.objects[dependency_cluster_path]
+        released = with_status(self.run, self.api.statuses[-1])
+        self.assertEqual(self.reconciler.reconcile(released), "Starting")
+        self.assertEqual(self.api.statuses[-1]["phase"], "Starting")
+        self.assertTrue(self.api.upserts)
+
+    def test_suspended_dependent_run_does_not_wait_in_queue(self):
+        self.run["spec"]["dependsOn"] = "run-0"
+        self.run["spec"]["suspend"] = True
+        self.assertEqual(self.reconciler.reconcile(self.run), "Suspended")
+        self.assertEqual(self.api.statuses[-1]["phase"], "Suspended")
+        self.assertEqual(self.api.upserts, [])
+
+    def test_running_dependent_run_does_not_return_to_queue(self):
+        self.run["spec"]["dependsOn"] = "run-0"
+        running = with_status(
+            self.run,
+            {
+                "phase": "Running",
+                "observedGeneration": 1,
+                "attempt": 0,
+                "activeNodes": ["node-a", "node-b"],
+                "spareNodes": ["node-c"],
+                "clusterName": "run-1-a00",
+                "rayAddress": "http://ray",
+                "submissionId": "run-1-a00",
+            },
+        )
+        cluster_path = namespaced_path(
+            "ray.io",
+            "v1",
+            "training",
+            "rayclusters",
+            "run-1-a00",
+        )
+        self.api.objects[cluster_path] = {
+            "metadata": {
+                "name": "run-1-a00",
+                "uid": "cluster-uid",
+                "annotations": {"training.kcc.io/run-uid": "uid-1"},
+            },
+            "status": {"state": "ready", "readyWorkerReplicas": 2},
+        }
+
+        self.assertEqual(self.reconciler.reconcile(running), "Running")
+        self.assertEqual(self.api.statuses, [])
+
     def test_ready_cluster_submits_effective_command_and_moves_running(self):
         self.run["spec"]["training"] = {
             "arguments": ["--micro-batch-size", "2"]

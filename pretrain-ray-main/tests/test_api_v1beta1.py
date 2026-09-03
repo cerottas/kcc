@@ -216,6 +216,43 @@ class ApiV1Beta1Tests(unittest.TestCase):
         with self.assertRaisesRegex(ApiValidationError, "suspendMode"):
             Run.from_resource(document)
 
+    def test_run_supports_a_preceding_training_run(self) -> None:
+        document = resource(
+            "TrainingRun",
+            "run-2",
+            {
+                "runtimeProfile": "a3",
+                "recipe": "recipe",
+                "workers": 2,
+                "dependsOn": "run-1",
+                "recovery": {
+                    "sameTopologyRetries": 1,
+                    "maxReplacements": 0,
+                    "noProgressSeconds": 3600,
+                },
+            },
+        )
+        self.assertEqual(Run.from_resource(document).depends_on, "run-1")
+
+    def test_run_rejects_a_self_dependency(self) -> None:
+        document = resource(
+            "TrainingRun",
+            "run-1",
+            {
+                "runtimeProfile": "a3",
+                "recipe": "recipe",
+                "workers": 2,
+                "dependsOn": "run-1",
+                "recovery": {
+                    "sameTopologyRetries": 1,
+                    "maxReplacements": 0,
+                    "noProgressSeconds": 3600,
+                },
+            },
+        )
+        with self.assertRaisesRegex(ApiValidationError, "same TrainingRun"):
+            Run.from_resource(document)
+
     def test_run_rejects_excessive_combined_recovery_budget(self) -> None:
         document = resource(
             "TrainingRun",

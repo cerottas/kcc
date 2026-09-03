@@ -128,6 +128,25 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("stopRequestGeneration", status)
         self.assertIn("stopBaselineIteration", status)
 
+    def test_training_run_contract_exposes_serial_dependency(self) -> None:
+        schema = crd("trainingruns.yaml")["spec"]["versions"][0]["schema"][
+            "openAPIV3Schema"
+        ]
+        spec = schema["properties"]["spec"]
+        self.assertIn("dependsOn", spec["properties"])
+        self.assertTrue(
+            any(
+                "dependsOn" in validation["rule"]
+                for validation in spec["x-kubernetes-validations"]
+            )
+        )
+        self.assertIn("Queued", schema["properties"]["status"]["properties"]["phase"]["enum"])
+        contract = json.loads(
+            (ROOT / "contracts/training-run.schema.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("dependsOn", contract["properties"]["spec"]["properties"])
+        self.assertIn("Queued", contract["$defs"]["status"]["properties"]["phase"]["enum"])
+
     def test_training_run_status_covers_runtime_checkpoint_and_diagnosis(self) -> None:
         status = crd("trainingruns.yaml")["spec"]["versions"][0]["schema"][
             "openAPIV3Schema"

@@ -415,6 +415,7 @@ class Run:
     no_progress_seconds: int
     suspended: bool
     suspend_mode: str
+    depends_on: str | None = None
     active_nodes: tuple[str, ...] = ()
     spare_nodes: tuple[str, ...] = ()
     command: tuple[str, ...] | None = None
@@ -436,7 +437,14 @@ class Run:
             spec,
             {"runtimeProfile", "recipe", "workers", "recovery"},
             "spec",
-            optional={"suspend", "suspendMode", "nodeSelection", "runtime", "training"},
+            optional={
+                "suspend",
+                "suspendMode",
+                "dependsOn",
+                "nodeSelection",
+                "runtime",
+                "training",
+            },
         )
         recovery = mapping(spec["recovery"], "spec.recovery")
         exact(recovery, {"sameTopologyRetries", "maxReplacements", "noProgressSeconds"}, "spec.recovery")
@@ -446,6 +454,13 @@ class Run:
         suspend_mode = spec.get("suspendMode", "Immediate")
         if suspend_mode not in {"Immediate", "AfterCheckpoint"}:
             raise ApiValidationError("suspendMode must be Immediate or AfterCheckpoint")
+        depends_on = (
+            dns(spec["dependsOn"], "dependsOn")
+            if "dependsOn" in spec
+            else None
+        )
+        if depends_on == identity.name:
+            raise ApiValidationError("dependsOn cannot reference the same TrainingRun")
         same_topology_retries = positive(
             recovery["sameTopologyRetries"], "sameTopologyRetries", minimum=0, maximum=10
         )
@@ -534,6 +549,7 @@ class Run:
             no_progress_seconds=positive(recovery["noProgressSeconds"], "noProgressSeconds", minimum=0),
             suspended=suspended,
             suspend_mode=suspend_mode,
+            depends_on=depends_on,
             active_nodes=active_nodes,
             spare_nodes=spare_nodes,
             command=command,
