@@ -23,6 +23,8 @@ from .checkpoints import (
     require_consistent,
     snapshot,
 )
+from .evaluation import EvaluationConfig
+from .evaluation_coordinator import EvaluationSupervisor
 from .spec import RuntimeSpec
 from .worker import StructuredWorker
 
@@ -517,6 +519,7 @@ def _result_payload(result: Mapping[str, Any]) -> tuple[str, bool, str]:
         "outputArtifact",
         "publicationRetryable",
         "rankTableSha256",
+        "evaluation",
     )
     summary = {key: compact[key] for key in essential_keys if key in compact}
     summary.update(diagnosticsTruncated=True, fullResultSha256=digest)
@@ -644,6 +647,10 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             raise CoordinatorError("submitted command binding is invalid") from error
         if submitted_command != spec.command:
             raise CoordinatorError("submitted command differs from mounted immutable spec")
+    evaluation_config = EvaluationConfig.from_environment(
+        spec.environment,
+        spec.devices_per_node,
+    )
 
     attempt_root = spec.output_root / f"attempt-{spec.attempt:02d}"
     attempt_root.mkdir(parents=True, exist_ok=False)
@@ -835,6 +842,40 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             if resume_checkpoint is not None
             else None
         )
+        evaluation: EvaluationSupervisor | None = None
+        if evaluation_config.enabled:
+            evaluation_baseline = retained_checkpoint_iteration
+            if evaluation_baseline is None:
+                try:
+                    baseline_views = list(
+                        ray.get(
+                            [
+                                actor.checkpoint_iteration.remote(
+                                    str(spec.checkpoint_root)
+                                )
+                                for _rank, _node, actor, _identity in ordered
+                            ],
+                            timeout=120,
+                        )
+                    )
+                    evaluation_baseline = consistent_checkpoint_iteration(
+                        baseline_views, spec.workers
+                    )
+                except Exception as error:
+                    print(
+                        "KCC_EVALUATION initial checkpoint observation warning: "
+                        f"{type(error).__name__}: {error}",
+                        flush=True,
+                    )
+            evaluation = EvaluationSupervisor(
+                ray=ray,
+                spec=spec,
+                ordered_workers=ordered,
+                config=evaluation_config,
+                consistent_iteration=consistent_checkpoint_iteration,
+                publish_progress=publish_progress,
+                baseline_iteration=evaluation_baseline,
+            )
 
         control_path = Path(os.environ.get("KCC_CONTROL_FILE", str(CONTROL_FILE)))
         try:
@@ -914,14 +955,19 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                         flush=True,
                     )
 
+        launch_details: dict[str, Any] = {
+            "command": list(spec.command),
+            "totalWorkers": spec.workers,
+            "resumeFrom": resume_from,
+        }
+        if evaluation is not None:
+            launch_details["evaluation"] = evaluation.summary()
         publish_progress(
             spec,
             "Training",
             "Running",
             "distributed training processes launched",
-            command=list(spec.command),
-            totalWorkers=spec.workers,
-            resumeFrom=resume_from,
+            **launch_details,
         )
         while pending:
             now = time.monotonic()
@@ -936,15 +982,20 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                         )
                 except (OSError, UnicodeError, ValueError):
                     checkpoint_iteration = None
+                heartbeat_details: dict[str, Any] = {
+                    "elapsedSeconds": round(now - training_started, 1),
+                    "completedWorkers": len(outcomes),
+                    "remainingWorkers": len(pending),
+                    "checkpointIteration": checkpoint_iteration,
+                }
+                if evaluation is not None:
+                    heartbeat_details["evaluation"] = evaluation.summary()
                 publish_progress(
                     spec,
                     "Training",
                     "Running",
                     "distributed training is running",
-                    elapsedSeconds=round(now - training_started, 1),
-                    completedWorkers=len(outcomes),
-                    remainingWorkers=len(pending),
-                    checkpointIteration=checkpoint_iteration,
+                    **heartbeat_details,
                 )
                 forward_training_output()
 
@@ -997,6 +1048,11 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                         )
                         stop_baseline_iteration = baseline or 0
 
+            if evaluation is not None:
+                evaluation.tick(
+                    allow_start=not immediate_stop_issued and not failure
+                )
+
             if (
                 stop_request_generation is not None
                 and not stop_issued
@@ -1047,7 +1103,8 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                             [
                                 actor.stop.remote(
                                     "checkpoint stop request "
-                                    f"{stop_request_generation}"
+                                    f"{stop_request_generation}",
+                                    cancel_evaluation=False,
                                 )
                                 for _rank, _node, actor, _identity in ordered
                             ],
@@ -1099,6 +1156,11 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
                     pass
 
         forward_training_output()
+        if evaluation is not None:
+            evaluation.settle(
+                allow_new=not immediate_stop_issued and not failure,
+                poll_seconds=control_poll_seconds,
+            )
 
         checkpoint_cleanup: Mapping[str, Any] | None = None
         checkpoint_cleanup_error: str | None = None
@@ -1173,6 +1235,9 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
         elif checkpoint_error is not None:
             status = "FAIL"
             failure_scope = "checkpoint"
+        elif evaluation is not None and evaluation.fatal_failure:
+            status = "FAIL"
+            failure_scope = "software"
         elif stop_issued or immediate_stop_issued:
             status = "STOPPED"
             failure_scope = None
@@ -1204,6 +1269,14 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             "preflights": preflights,
             "workers": outcomes,
         }
+        if evaluation is not None:
+            result["evaluation"] = dict(evaluation.summary())
+            if (
+                evaluation.fatal_failure
+                and not failure
+                and checkpoint_error is None
+            ):
+                result["failure"] = evaluation.failure_message
         if stop_issued:
             result.update(
                 stopReason="AfterCheckpoint",
@@ -1220,15 +1293,22 @@ def execute(spec: RuntimeSpec) -> Mapping[str, Any]:
             result["checkpointFailure"] = str(checkpoint_error)
         if checkpoint_cleanup_error is not None:
             result["checkpointCleanupFailure"] = checkpoint_cleanup_error
+        completion_details: dict[str, Any] = {
+            "completedWorkers": len(outcomes),
+            "checkpointIteration": (
+                checkpoint.get("iteration")
+                if isinstance(checkpoint, Mapping)
+                else None
+            ),
+        }
+        if evaluation is not None:
+            completion_details["evaluation"] = evaluation.summary()
         publish_progress(
             spec,
             "Training",
             "Passed" if status == "PASS" else status.title(),
             f"distributed training finished with {status}",
-            completedWorkers=len(outcomes),
-            checkpointIteration=(
-                checkpoint.get("iteration") if isinstance(checkpoint, Mapping) else None
-            ),
+            **completion_details,
         )
         return result
     finally:

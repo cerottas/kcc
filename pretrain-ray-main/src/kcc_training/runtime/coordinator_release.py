@@ -85,7 +85,7 @@ def _receipt_result(result: Mapping[str, Any]) -> dict[str, Any]:
     checkpoint = result.get("checkpoint")
     if isinstance(checkpoint, Mapping):
         checkpoint = _checkpoint_summary(checkpoint)
-    return {
+    receipt = {
         key: result[key]
         for key in (
             "schemaVersion",
@@ -102,6 +102,10 @@ def _receipt_result(result: Mapping[str, Any]) -> dict[str, Any]:
         )
         if key in result
     } | {"checkpoint": checkpoint, "trainingAttempt": int(result["attempt"])}
+    evaluation = result.get("evaluation")
+    if isinstance(evaluation, Mapping):
+        receipt["evaluation"] = dict(evaluation)
+    return receipt
 
 
 def _receipt_path(spec: RuntimeSpec) -> Path:
@@ -298,6 +302,16 @@ def main(
         )
     if spec is not None:
         final_status = str(result.get("status", "FAIL"))
+        final_details: dict[str, Any] = {
+            "outputArtifact": result.get("outputArtifact"),
+            "checkpointIteration": (
+                result.get("checkpoint", {}).get("iteration")
+                if isinstance(result.get("checkpoint"), Mapping)
+                else None
+            ),
+        }
+        if isinstance(result.get("evaluation"), Mapping):
+            final_details["evaluation"] = result["evaluation"]
         publish_progress(
             spec,
             "Completed" if final_status == "PASS" else "Failed",
@@ -307,12 +321,7 @@ def main(
                 if final_status == "PASS"
                 else str(result.get("failure") or f"runtime finished with {final_status}")
             ),
-            outputArtifact=result.get("outputArtifact"),
-            checkpointIteration=(
-                result.get("checkpoint", {}).get("iteration")
-                if isinstance(result.get("checkpoint"), Mapping)
-                else None
-            ),
+            **final_details,
         )
     try:
         _publish(result)

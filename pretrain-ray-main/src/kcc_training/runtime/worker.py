@@ -18,6 +18,7 @@ from .checkpoints import (
     discard_uncommitted,
     snapshot,
 )
+from .evaluation_worker import EvaluationProcessMixin
 
 
 class WorkerError(RuntimeError):
@@ -111,10 +112,13 @@ def shared_training_progress_signature(
     return tuple(signature)
 
 
-class StructuredWorker:
+class StructuredWorker(EvaluationProcessMixin):
+    evaluation_error_type = WorkerError
+
     def __init__(self) -> None:
         self.process: subprocess.Popen[str] | None = None
         self.stop_reason: str | None = None
+        self._init_evaluation()
 
     def identity(self) -> dict[str, str]:
         result = {key: os.environ.get(key, "") for key in ("NODE_NAME", "POD_NAME", "POD_IP", "HOST_IP")}
@@ -316,7 +320,9 @@ class StructuredWorker:
             "stderr": str(stderr_path),
         }
 
-    def stop(self, reason: str) -> None:
+    def stop(self, reason: str, *, cancel_evaluation: bool = True) -> None:
         self.stop_reason = reason
         if self.process is not None:
             self._terminate(self.process)
+        if cancel_evaluation:
+            self.cancel_evaluation(reason)
