@@ -345,7 +345,6 @@ docker buildx build --load --pull --platform linux/arm64 \
   --build-arg "LIGHTEVAL_VERSION=$lighteval_version" \
   --build-arg "LIGHTEVAL_VCS_REF=$lighteval_ref" \
   --build-arg "LIGHTEVAL_VCS_DIRTY=$lighteval_dirty" \
-  --build-arg "LIGHTEVAL_PYTHON=$resolved_python" \
   --tag "$image" \
   --file docker/Dockerfile.worker-lighteval-prebuilt "$temporary"
 

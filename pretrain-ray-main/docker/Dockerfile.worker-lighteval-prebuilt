@@ -9,7 +9,6 @@ ARG VCS_REF=unknown
 ARG LIGHTEVAL_VERSION=0.13.1.dev0
 ARG LIGHTEVAL_VCS_REF=unknown
 ARG LIGHTEVAL_VCS_DIRTY=unknown
-ARG LIGHTEVAL_PYTHON=python3
 
 LABEL org.opencontainers.image.title="kcc-training-worker-lighteval" \
       org.opencontainers.image.version="${VERSION}" \
@@ -25,7 +24,6 @@ COPY lighteval-python/ /opt/kcc/lighteval-python/
 
 # Keep LightEval opt-in.  The training process retains the base image's
 # PYTHONPATH; the evaluator prepends this directory only to its own subprocess.
-RUN PYTHONNOUSERSITE=1 \
-    PYTHONPATH="/opt/kcc/lighteval-python:${PYTHONPATH:-}" \
-    "${LIGHTEVAL_PYTHON}" -c \
-      "import lighteval; from lighteval.models.megatron.megatron_runner import scan_checkpoints; assert lighteval.__version__ == '${LIGHTEVAL_VERSION}', lighteval.__version__; assert lighteval.__file__.startswith('/opt/kcc/lighteval-python/')"
+# The build script already imports this exact payload with the target worker's
+# Python on an arm64 node. Keep final assembly COPY-only so an amd64 control
+# host does not need QEMU merely to package the arm64 worker image.
