@@ -97,6 +97,7 @@ _CONTROLLER_ENVIRONMENT = frozenset(
         "KCC_DATA_DIR",
         "KCC_OUTPUT_ROOT",
         "KCC_CHECKPOINT_ROOT",
+        "KCC_RUN_NAME",
     }
 )
 

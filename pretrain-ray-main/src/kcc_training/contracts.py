@@ -30,6 +30,7 @@ _BLOCKED_ENVIRONMENT = {
     "KCC_DATA_DIR",
     "KCC_OUTPUT_ROOT",
     "KCC_CHECKPOINT_ROOT",
+    "KCC_RUN_NAME",
 }
 
 
@@ -443,4 +444,3 @@ def load_contract(path: Path) -> object:
     if loader is None:
         raise ContractError(f"unsupported kind: {kind!r}")
     return loader(path)
-

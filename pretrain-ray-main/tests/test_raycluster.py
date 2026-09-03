@@ -69,6 +69,7 @@ class RayClusterTests(unittest.TestCase):
         recipe = replace(
             recipe,
             framework="mindspeed-llm",
+            environment={"WANDB_MODE": "online"},
             script_name="pretrain_150M.sh",
             script_content="#!/usr/bin/env bash\npython pretrain_gpt.py\n",
         )
@@ -93,6 +94,18 @@ class RayClusterTests(unittest.TestCase):
         self.assertIn(
             {"name": "mindspeed-models", "mountPath": "/mnt/models"},
             worker["containers"][0]["volumeMounts"],
+        )
+        self.assertIn(
+            {
+                "name": "WANDB_API_KEY",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "kcc-wandb",
+                        "key": "WANDB_API_KEY",
+                    }
+                },
+            },
+            worker["containers"][0]["env"],
         )
         self.assertEqual(
             configmap["data"]["pretrain_150M.sh"],
@@ -262,6 +275,7 @@ class RayClusterTests(unittest.TestCase):
             ["python", "custom_train.py", "--micro-batch-size", "2"],
         )
         self.assertEqual(runtime["training"]["environment"]["CUSTOM_FLAG"], "enabled")
+        self.assertEqual(runtime["training"]["environment"]["KCC_RUN_NAME"], "run-1")
         self.assertEqual(
             runtime["artifacts"]["source"]["uri"],
             "artifact://training/source/v2",

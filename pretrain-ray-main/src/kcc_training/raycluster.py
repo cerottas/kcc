@@ -141,6 +141,7 @@ def runtime_spec(
         "KCC_DATA_DIR": data_target,
         "KCC_OUTPUT_ROOT": output_root,
         "KCC_CHECKPOINT_ROOT": checkpoint_root,
+        "KCC_RUN_NAME": run.identity.name,
     }
     return {
         "schemaVersion": "kcc-runtime/v1",
@@ -237,6 +238,22 @@ def render_attempt(
             ]
         )
     spec = runtime_spec(run, profile, recipe, attempt=attempt, active_nodes=active_nodes)
+    if (
+        recipe.framework == "mindspeed-llm"
+        and spec["training"]["environment"].get("WANDB_MODE", "disabled").lower()
+        not in {"disabled", "offline"}
+    ):
+        worker_environment.append(
+            {
+                "name": "WANDB_API_KEY",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "kcc-wandb",
+                        "key": "WANDB_API_KEY",
+                    }
+                },
+            }
+        )
     configmap = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
