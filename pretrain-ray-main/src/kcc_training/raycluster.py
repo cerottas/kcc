@@ -239,7 +239,7 @@ def render_attempt(
         )
     spec = runtime_spec(run, profile, recipe, attempt=attempt, active_nodes=active_nodes)
     if (
-        recipe.framework == "mindspeed-llm"
+        (run.wandb_secret_ref is not None or recipe.framework == "mindspeed-llm")
         and spec["training"]["environment"].get("WANDB_MODE", "disabled").lower()
         not in {"disabled", "offline"}
     ):
@@ -248,7 +248,7 @@ def render_attempt(
                 "name": "WANDB_API_KEY",
                 "valueFrom": {
                     "secretKeyRef": {
-                        "name": "kcc-wandb",
+                        "name": run.wandb_secret_ref or "kcc-wandb",
                         "key": "WANDB_API_KEY",
                     }
                 },

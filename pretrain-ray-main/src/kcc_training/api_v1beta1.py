@@ -421,6 +421,7 @@ class Run:
     command: tuple[str, ...] | None = None
     command_arguments: tuple[str, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict)
+    wandb_secret_ref: str | None = None
     source_uri: str | None = None
     model_uri: str | None = None
     data_uri: str | None = None
@@ -498,7 +499,7 @@ class Run:
             training,
             set(),
             "spec.training",
-            optional={"command", "arguments", "environment", "artifacts"},
+            optional={"command", "arguments", "environment", "artifacts", "wandbSecretRef"},
         )
         raw_command = training.get("command")
         command = None
@@ -539,6 +540,9 @@ class Run:
             output_subpath = text(output_subpath, "spec.training.artifacts.outputSubpath")
             if output_subpath.startswith("/") or ".." in output_subpath.split("/"):
                 raise ApiValidationError("spec.training.artifacts.outputSubpath is unsafe")
+        wandb_secret_ref = training.get("wandbSecretRef")
+        if "wandbSecretRef" in training and wandb_secret_ref != f"{identity.name}-wandb":
+            raise ApiValidationError("spec.training.wandbSecretRef must belong to this TrainingRun")
         return cls(
             identity=identity,
             profile_name=dns(spec["runtimeProfile"], "runtimeProfile"),
@@ -555,6 +559,7 @@ class Run:
             command=command,
             command_arguments=command_arguments,
             environment=environment,
+            wandb_secret_ref=wandb_secret_ref,
             source_uri=(artifact_uri(artifacts["source"], "spec.training.artifacts.source") if "source" in artifacts else None),
             model_uri=(artifact_uri(artifacts["model"], "spec.training.artifacts.model") if "model" in artifacts else None),
             data_uri=(artifact_uri(artifacts["data"], "spec.training.artifacts.data") if "data" in artifacts else None),
